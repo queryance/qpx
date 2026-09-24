@@ -143,3 +143,148 @@ func (sc *vscanner) Next() bool {
 			for j := range b.Columns {
 				if err := sc.appendCell(&b.Columns[j], &sc.meta[j], raw[j]); err != nil {
 					sc.scanErr = err
+					return false
+				}
+			}
+		} else {
+			// Ragged wire row (should not happen for table scans):
+			// nil-fill short, ignore extras — same contract as the
+			// legacy scanner, so both paths stay rectangular.
+			for j := range b.Columns {
+				var buf []byte
+				if j < len(raw) {
+					buf = raw[j]
+				}
+				if err := sc.appendCell(&b.Columns[j], &sc.meta[j], buf); err != nil {
+					sc.scanErr = err
+					return false
+				}
+			}
+		}
+		b.NumRows++
+	}
+	if err := sc.rows.Err(); err != nil {
+		sc.scanErr = fmt.Errorf("postgres: vector rows: %w", err)
+		return false
+	}
+	if b.NumRows == 0 {
+		return false
+	}
+	sc.cur = b
+	return true
+}
+
+// Batch returns the current batch, valid until the next Next call in
+// direct-drive use; owned by the caller once handed to a scheduler.
+func (sc *vscanner) Batch() *vector.Batch {
+	return sc.cur
+}
+
+// Err reports any streaming failure, or nil at end of stream.
+func (sc *vscanner) Err() error {
+	return sc.scanErr
+}
+
+// Close releases the rows and connection. Idempotent; bounded by the same
+// closeTimeout as the legacy scanner.
+func (sc *vscanner) Close() error {
+	if sc.closed {
+		return nil
+	}
+	sc.closed = true
+	sc.rows.Close()
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(sc.ctx), closeTimeout)
+	defer cancel()
+	if err := sc.conn.Close(ctx); err != nil {
+		return fmt.Errorf("postgres: vector close: %w", err)
+	}
+	return nil
+}
+
+func (sc *vscanner) appendCell(c *vector.Column, m *colMeta, buf []byte) error {
+	if buf == nil {
+		c.AppendNull()
+		return nil
+	}
+	var err error
+	switch m.typ {
+	case engine.Int64:
+		var v int64
+		v, err = decodeInt(buf, m.format)
+		if err == nil {
+			c.AppendInt(v)
+		}
+	case engine.Float64:
+		var v float64
+		v, err = decodeFloat(buf, m.format)
+		if err == nil {
+			c.AppendFloat(v)
+		}
+	case engine.Bool:
+		var v bool
+		v, err = decodeBool(buf, m.format)
+		if err == nil {
+			c.AppendBool(v)
+		}
+	case engine.String:
+		var v string
+		v, err = sc.decodeString(buf, m)
+		if err == nil {
+			c.AppendString(v)
+		}
+	case engine.Bytes:
+		var v []byte
+		v, err = decodeBytes(buf, m.format)
+		if err == nil {
+			c.AppendBytes(v)
+		}
+	case engine.Time:
+		var v time.Time
+		v, err = sc.decodeTime(buf, m)
+		if err == nil {
+			c.AppendTime(v)
+		}
+	case engine.Numeric:
+		var v string
+		v, err = sc.decodeNumeric(buf, m)
+		if err == nil {
+			c.AppendNumeric(v)
+		}
+	default:
+		var v string
+		v, err = sc.decodeString(buf, m)
+		if err == nil {
+			c.AppendString(v)
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("postgres: vector: decode: %w", err)
+	}
+	return nil
+}
+
+// decodeInt handles binary int2/int4/int8 (width from payload length) and
+// text integers.
+func decodeInt(buf []byte, format int16) (int64, error) {
+	if format == pgtype.BinaryFormatCode {
+		switch len(buf) {
+		case 2:
+			return int64(int16(binary.BigEndian.Uint16(buf))), nil
+		case 4:
+			return int64(int32(binary.BigEndian.Uint32(buf))), nil
+		case 8:
+			return int64(binary.BigEndian.Uint64(buf)), nil
+		default:
+			return 0, fmt.Errorf("int: binary length %d", len(buf))
+		}
+	}
+	v, err := strconv.ParseInt(string(buf), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("int: %w", err)
+	}
+	return v, nil
+}
+
+// decodeFloat handles binary float4/float8 and text floats.
+func decodeFloat(buf []byte, format int16) (float64, error) {
+	if format == pgtype.BinaryFormatCode {

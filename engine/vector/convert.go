@@ -78,3 +78,85 @@ func FromChunk(c engine.Chunk) (*Batch, error) {
 				aerr = appendIntCell(col, v, j, i)
 			case engine.Float64:
 				aerr = appendFloatCell(col, v, j, i)
+			case engine.Bool:
+				bv, ok := v.(bool)
+				if !ok {
+					aerr = fmt.Errorf("column %d row %d: %T is not bool", j, i, v)
+				} else {
+					col.AppendBool(bv)
+				}
+			case engine.String:
+				sv, ok := v.(string)
+				if !ok {
+					aerr = fmt.Errorf("column %d row %d: %T is not string", j, i, v)
+				} else {
+					col.AppendString(sv)
+				}
+			case engine.Bytes:
+				bv, ok := v.([]byte)
+				if !ok {
+					aerr = fmt.Errorf("column %d row %d: %T is not []byte", j, i, v)
+				} else {
+					col.AppendBytes(bv)
+				}
+			case engine.Time:
+				tv, ok := v.(time.Time)
+				if !ok {
+					aerr = fmt.Errorf("column %d row %d: %T is not time.Time", j, i, v)
+				} else {
+					col.AppendTime(tv)
+				}
+			case engine.Numeric:
+				sv, ok := v.(string)
+				if !ok {
+					aerr = fmt.Errorf("column %d row %d: %T is not string (numeric text form)", j, i, v)
+				} else {
+					col.AppendNumeric(sv)
+				}
+			default:
+				sv, ok := v.(string)
+				if !ok {
+					aerr = fmt.Errorf("column %d row %d: %T is not string", j, i, v)
+				} else {
+					col.AppendString(sv)
+				}
+			}
+			if aerr != nil {
+				return nil, fmt.Errorf("vector: from chunk: %w", aerr)
+			}
+		}
+	}
+	b.NumRows = c.NumRows()
+	if err := b.Validate(); err != nil {
+		return nil, fmt.Errorf("vector: from chunk: %w", err)
+	}
+	return b, nil
+}
+
+func appendIntCell(col *Column, v any, j, i int) error {
+	switch n := v.(type) {
+	case int64:
+		col.AppendInt(n)
+	case int32:
+		col.AppendInt(int64(n))
+	case int16:
+		col.AppendInt(int64(n))
+	case int:
+		col.AppendInt(int64(n))
+	default:
+		return fmt.Errorf("column %d row %d: %T is not an int type", j, i, v)
+	}
+	return nil
+}
+
+func appendFloatCell(col *Column, v any, j, i int) error {
+	switch n := v.(type) {
+	case float64:
+		col.AppendFloat(n)
+	case float32:
+		col.AppendFloat(float64(n))
+	default:
+		return fmt.Errorf("column %d row %d: %T is not a float type", j, i, v)
+	}
+	return nil
+}

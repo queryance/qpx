@@ -408,3 +408,206 @@ func (g *GroupByString) Merge(other *GroupByString) {
 	}
 }
 
+// Reset clears all groups for reuse.
+func (g *GroupByString) Reset() {
+	for k := range g.groups {
+		delete(g.groups, k)
+	}
+	g.nullKey = groupState{}
+	g.hasNull = false
+}
+
+// Len reports the number of groups, including the NULL group when present.
+func (g *GroupByString) Len() int {
+	n := len(g.groups)
+	if g.hasNull {
+		n++
+	}
+	return n
+}
+
+// HasNullGroup reports whether any NULL key was seen.
+func (g *GroupByString) HasNullGroup() bool { return g.hasNull }
+
+// SortedRows returns groups ordered by key; the NULL group sorts last.
+func (g *GroupByString) SortedRows() []StringGroup {
+	out := make([]StringGroup, 0, g.Len())
+	for k, st := range g.groups {
+		gr := StringGroup{Key: k, Rows: st.rows, Count: st.count, Sum: st.sum}
+		if st.count > 0 {
+			gr.Avg = st.sum / float64(st.count)
+		}
+		out = append(out, gr)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	return out
+}
+
+// NullGroup returns the NULL-key group, or nil when no NULL key was seen.
+func (g *GroupByString) NullGroup() *StringGroup {
+	if !g.hasNull {
+		return nil
+	}
+	gr := StringGroup{Rows: g.nullKey.rows, Count: g.nullKey.count, Sum: g.nullKey.sum}
+	if g.nullKey.count > 0 {
+		gr.Avg = g.nullKey.sum / float64(g.nullKey.count)
+	}
+	return &gr
+}
+
+// measureAt reads the value/validity at physical row r. hasVal is false
+// for count-only aggregations (no value column): always invalid, zero.
+// NULL values are invalid (skipped by sum/avg) but still counted in rows.
+func measureAt(vals []float64, valNulls []bool, hasVal bool, r int) (float64, bool) {
+	if !hasVal {
+		return 0, false
+	}
+	if len(valNulls) > 0 && valNulls[r] {
+		return 0, false
+	}
+	return vals[r], true
+}
+
+// Parallel aggregation: shard batches across workers, one local agg per
+// worker, single-threaded merge at the end. Workers never share a map,
+// so there is no lock contention by construction; the merge is O(groups
+// × workers) and runs once. Sharding is contiguous (not round-robin) to
+// keep each worker on adjacent batches. workers <= 1 runs sequentially.
+// The input batches are read-only and may be shared; each agg copies
+// group keys into its own map.
+
+// ParallelGlobalAgg folds batches with workers local GlobalFloatAggs and
+// merges them into one result.
+func ParallelGlobalAgg(batches []*Batch, workers, col int) (*GlobalFloatAgg, error) {
+	w := clampWorkers(len(batches), workers)
+	locals := make([]*GlobalFloatAgg, w)
+	for i := range locals {
+		locals[i] = NewGlobalFloatAgg(col)
+	}
+	err := parallelRun(batches, w, func(i int, shard []*Batch) error {
+		for _, b := range shard {
+			if err := locals[i].Add(b); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := NewGlobalFloatAgg(col)
+	for _, l := range locals {
+		out.Merge(l)
+	}
+	return out, nil
+}
+
+// ParallelGroupByInt64 folds batches with workers local GroupByInt64s
+// (keyCol, valCol, mod as in NewGroupByInt64) and merges them.
+func ParallelGroupByInt64(batches []*Batch, workers, keyCol, valCol int, mod int64) (*GroupByInt64, error) {
+	w := clampWorkers(len(batches), workers)
+	locals := make([]*GroupByInt64, w)
+	for i := range locals {
+		locals[i] = NewGroupByInt64(keyCol, valCol, mod)
+	}
+	err := parallelRun(batches, w, func(i int, shard []*Batch) error {
+		for _, b := range shard {
+			if err := locals[i].Add(b); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := NewGroupByInt64(keyCol, valCol, mod)
+	for _, l := range locals {
+		out.Merge(l)
+	}
+	return out, nil
+}
+
+// ParallelGroupByString folds batches with workers local GroupByStrings
+// and merges them.
+func ParallelGroupByString(batches []*Batch, workers, keyCol, valCol int) (*GroupByString, error) {
+	w := clampWorkers(len(batches), workers)
+	locals := make([]*GroupByString, w)
+	for i := range locals {
+		locals[i] = NewGroupByString(keyCol, valCol)
+	}
+	err := parallelRun(batches, w, func(i int, shard []*Batch) error {
+		for _, b := range shard {
+			if err := locals[i].Add(b); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := NewGroupByString(keyCol, valCol)
+	for _, l := range locals {
+		out.Merge(l)
+	}
+	return out, nil
+}
+
+// clampWorkers bounds the worker count to [1, len(batches)] (empty input
+// still yields one local so the merged result is well-defined).
+func clampWorkers(n, workers int) int {
+	if workers < 1 {
+		workers = 1
+	}
+	if n > 0 && workers > n {
+		workers = n
+	}
+	return workers
+}
+
+// parallelRun executes run over contiguous shards, one goroutine per
+// worker. Each worker touches only its own shard and local state; errs
+// are collected after the done barrier (channel receive happens-before
+// the read, so no mutex is needed). The first shard error is returned.
+func parallelRun(batches []*Batch, workers int, run func(worker int, shard []*Batch) error) error {
+	if workers <= 1 {
+		return run(0, batches)
+	}
+	n := len(batches)
+	errs := make([]error, workers)
+	done := make(chan struct{}, workers)
+	for w := 0; w < workers; w++ {
+		lo := w * n / workers
+		hi := (w + 1) * n / workers
+		go func(w int, shard []*Batch) {
+			errs[w] = run(w, shard)
+			done <- struct{}{}
+		}(w, batches[lo:hi])
+	}
+	for range workers {
+		<-done
+	}
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func checkAggColumn(b *Batch, col int, kind engine.DataType, op string) error {
+	if b == nil {
+		return fmt.Errorf("vector: %s: nil batch", op)
+	}
+	if col < 0 || col >= len(b.Columns) {
+		return fmt.Errorf("vector: %s: column %d out of range (have %d)", op, col, len(b.Columns))
+	}
+	if got := b.Columns[col].Type; got != kind {
+		return fmt.Errorf("vector: %s: column %d is %v, want %v", op, col, got, kind)
+	}
+	if err := b.Validate(); err != nil {
+		return fmt.Errorf("vector: %s: %w", op, err)
+	}
+	return nil
+}

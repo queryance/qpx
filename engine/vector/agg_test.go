@@ -228,3 +228,234 @@ func TestGroupByInt64CountOnlyAndSel(t *testing.T) {
 func TestGroupByInt64Merge(t *testing.T) {
 	bs := []*vector.Batch{aggBatch(0, 100), aggBatch(100, 100), aggBatch(250, 40)}
 	seq := vector.NewGroupByInt64(0, 1, 7)
+	for _, b := range bs {
+		mustAdd(t, seq.Add, b)
+	}
+	par, err := vector.ParallelGroupByInt64(bs, 3, 0, 1, 7)
+	if err != nil {
+		t.Fatalf("ParallelGroupByInt64: %v", err)
+	}
+	srows, prows := seq.SortedRows(), par.SortedRows()
+	if len(srows) != len(prows) {
+		t.Fatalf("group counts %d != %d", len(prows), len(srows))
+	}
+	for i := range srows {
+		if !sameInt64Group(srows[i], prows[i]) {
+			t.Fatalf("group %d: parallel %+v != sequential %+v", i, prows[i], srows[i])
+		}
+	}
+	if (seq.NullGroup() == nil) != (par.NullGroup() == nil) {
+		t.Fatal("NULL group presence differs after merge")
+	}
+	// Merge of empty into non-empty is identity.
+	empty := vector.NewGroupByInt64(0, 1, 7)
+	seq.Merge(empty)
+	if len(seq.SortedRows()) != len(srows) {
+		t.Fatal("merge with empty changed groups")
+	}
+	seq.Reset()
+	if seq.Len() != 0 || seq.HasNullGroup() {
+		t.Fatal("Reset must clear all groups")
+	}
+}
+
+func TestGroupByString(t *testing.T) {
+	// t cycles a/b/c over ids 1..9: 3 rows each.
+	g := vector.NewGroupByString(2, 1)
+	mustAdd(t, g.Add, aggBatch(0, 9))
+	rows := g.SortedRows()
+	if len(rows) != 3 {
+		t.Fatalf("groups = %d, want 3", len(rows))
+	}
+	if rows[0].Key != "a" || rows[0].Rows != 3 || rows[0].Count != 3 {
+		t.Fatalf("group a = %+v", rows[0])
+	}
+	// a holds ids 1,4,7: sum = 1.2.
+	if !closeEnough(rows[0].Sum, 1.2) {
+		t.Fatalf("group a sum = %v, want 1.2", rows[0].Sum)
+	}
+
+	// NULL key + NULL value.
+	b := aggBatch(0, 3)
+	b.Columns[2].Strings[0] = ""
+	b.Columns[2].Nulls = make([]bool, 3)
+	b.Columns[2].Nulls[0] = true
+	b.Columns[2].HasNulls = true
+	g2 := vector.NewGroupByString(2, 1)
+	mustAdd(t, g2.Add, b)
+	if !g2.HasNullGroup() || g2.Len() != 3 {
+		t.Fatalf("want 3 groups incl NULL, got %d", g2.Len())
+	}
+
+	// Parallel equals sequential.
+	bs := []*vector.Batch{aggBatch(0, 500), aggBatch(500, 500)}
+	seq := vector.NewGroupByString(2, 1)
+	for _, b := range bs {
+		mustAdd(t, seq.Add, b)
+	}
+	par, err := vector.ParallelGroupByString(bs, 4, 2, 1)
+	if err != nil {
+		t.Fatalf("ParallelGroupByString: %v", err)
+	}
+	srows, prows := seq.SortedRows(), par.SortedRows()
+	if len(srows) != len(prows) {
+		t.Fatalf("group counts %d != %d", len(prows), len(srows))
+	}
+	for i := range srows {
+		if !sameStringGroup(srows[i], prows[i]) {
+			t.Fatalf("group %d: parallel %+v != sequential %+v", i, prows[i], srows[i])
+		}
+	}
+
+	// Count-only string path.
+	gc := vector.NewGroupByString(2, -1)
+	mustAdd(t, gc.Add, aggBatch(0, 6))
+	for _, gr := range gc.SortedRows() {
+		if gr.Rows != 2 || gr.Count != 0 {
+			t.Fatalf("count-only group = %+v", gr)
+		}
+	}
+}
+
+func TestParallelGroupByFilteredNulls(t *testing.T) {
+	// The real filtered-agg shape: Filter-produced Sel plus NULL keys and
+	// NULL values, merged across workers. Dense-only parallel tests miss
+	// the Sel-indexed Add loops and the sharded null-key merge.
+	mk := func() []*vector.Batch {
+		bs := []*vector.Batch{aggBatch(0, 120), aggBatch(120, 120), aggBatch(240, 100)}
+		f := vector.NewFloat64Filter(1, vector.Gt, 5.0)
+		for _, b := range bs {
+		n := b.NumRows
+		b.Columns[0].Nulls = make([]bool, n)
+		b.Columns[1].Nulls = make([]bool, n)
+		b.Columns[2].Nulls = make([]bool, n)
+		for r := 0; r < n; r++ {
+			if r%17 == 0 {
+				b.Columns[0].Nulls[r] = true
+				b.Columns[0].HasNulls = true
+			}
+			if r%13 == 0 {
+				b.Columns[1].Nulls[r] = true
+				b.Columns[1].HasNulls = true
+			}
+			if r%19 == 0 {
+				b.Columns[2].Nulls[r] = true
+				b.Columns[2].HasNulls = true
+			}
+		}
+		if _, err := f.Process(b); err != nil {
+			t.Fatalf("filter: %v", err)
+		}
+		if b.Sel == nil {
+			t.Fatalf("fixture must be Sel-filtered")
+		}
+	}
+		return bs
+	}
+
+	// Int64 keys (mod 4 forces cross-worker group merges) with NULL keys.
+	bs := mk()
+	seq := vector.NewGroupByInt64(0, 1, 4)
+	for _, b := range bs {
+		mustAdd(t, seq.Add, b)
+	}
+	if !seq.HasNullGroup() {
+		t.Fatal("fixture must retain a NULL int64 key after filtering")
+	}
+	par, err := vector.ParallelGroupByInt64(bs, 3, 0, 1, 4)
+	if err != nil {
+		t.Fatalf("ParallelGroupByInt64: %v", err)
+	}
+	srows, prows := seq.SortedRows(), par.SortedRows()
+	if len(srows) != len(prows) {
+		t.Fatalf("group counts %d != %d", len(prows), len(srows))
+	}
+	for i := range srows {
+		if !sameInt64Group(srows[i], prows[i]) {
+			t.Fatalf("group %d: parallel %+v != sequential %+v", i, prows[i], srows[i])
+		}
+	}
+	if (seq.NullGroup() == nil) != (par.NullGroup() == nil) {
+		t.Fatal("NULL group presence differs after merge")
+	} else if seq.NullGroup() != nil && !sameInt64Group(*seq.NullGroup(), *par.NullGroup()) {
+		t.Fatalf("NULL group: parallel %+v != sequential %+v", par.NullGroup(), seq.NullGroup())
+	}
+
+	// String keys with NULL keys over the same filtered batches.
+	sseq := vector.NewGroupByString(2, 1)
+	for _, b := range bs {
+		mustAdd(t, sseq.Add, b)
+	}
+	if !sseq.HasNullGroup() {
+		t.Fatal("fixture must retain a NULL string key after filtering")
+	}
+	spar, err := vector.ParallelGroupByString(bs, 3, 2, 1)
+	if err != nil {
+		t.Fatalf("ParallelGroupByString: %v", err)
+	}
+	ssrows, sprows := sseq.SortedRows(), spar.SortedRows()
+	if len(ssrows) != len(sprows) {
+		t.Fatalf("group counts %d != %d", len(sprows), len(ssrows))
+	}
+	for i := range ssrows {
+		if !sameStringGroup(ssrows[i], sprows[i]) {
+			t.Fatalf("group %d: parallel %+v != sequential %+v", i, sprows[i], ssrows[i])
+		}
+	}
+	if (sseq.NullGroup() == nil) != (spar.NullGroup() == nil) {
+		t.Fatal("string NULL group presence differs after merge")
+	}
+}
+
+func TestAggRejects(t *testing.T) {	b := aggBatch(0, 2)
+	if err := vector.NewGroupByInt64(2, 1, 0).Add(b); err == nil {
+		t.Fatal("string key as int64 must fail")
+	}
+	if err := vector.NewGroupByInt64(0, 2, 0).Add(b); err == nil {
+		t.Fatal("string value as float must fail")
+	}
+	if err := vector.NewGroupByString(0, 1).Add(b); err == nil {
+		t.Fatal("int key as string must fail")
+	}
+	if err := vector.NewGroupByInt64(9, 1, 0).Add(b); err == nil {
+		t.Fatal("out-of-range key must fail")
+	}
+	if err := vector.NewGroupByInt64(0, 1, 0).Add(nil); err == nil {
+		t.Fatal("nil batch must fail")
+	}
+}
+
+// closeEnough compares floats with a relative epsilon: parallel merges
+// sum partitions in a different order, so the last ulp may differ from
+// a sequential fold. Parity against PG uses absolute tolerances (see
+// postgres/vector_agg_test.go); here we only assert merge order does not
+// change the result beyond float noise.
+func closeEnough(a, b float64) bool {
+	if a == b {
+		return true
+	}
+	d := a - b
+	if d < 0 {
+		d = -d
+	}
+	m := a
+	if m < 0 {
+		m = -m
+	}
+	if b < 0 {
+		m += -b
+	} else {
+		m += b
+	}
+	return d <= 1e-9*m
+}
+
+func sameInt64Group(a, b vector.Int64Group) bool {
+	return a.Key == b.Key && a.Rows == b.Rows && a.Count == b.Count &&
+		closeEnough(a.Sum, b.Sum) && closeEnough(a.Avg, b.Avg)
+}
+
+func sameStringGroup(a, b vector.StringGroup) bool {
+	return a.Key == b.Key && a.Rows == b.Rows && a.Count == b.Count &&
+		closeEnough(a.Sum, b.Sum) && closeEnough(a.Avg, b.Avg)
+}

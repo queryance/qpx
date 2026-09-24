@@ -278,3 +278,278 @@ func filterFloat64Into(b *Batch, c *Column, cmp Cmp, v float64) {
 		for r := miss + 1; r < b.NumRows; r++ {
 			if !nulls[r] && applyFloatCmp(data[r], cmp, v) {
 				out = append(out, int32(r))
+			}
+		}
+		if len(out) == 0 {
+			out = []int32{}
+		}
+		b.Sel = out
+		return
+	}
+	sel := b.Sel
+	n := 0
+	if len(c.Nulls) == 0 {
+		for _, s := range sel {
+			if applyFloatCmp(data[int(s)], cmp, v) {
+				sel[n] = s
+				n++
+			}
+		}
+	} else {
+		nulls := c.Nulls
+		for _, s := range sel {
+			if !nulls[int(s)] && applyFloatCmp(data[int(s)], cmp, v) {
+				sel[n] = s
+				n++
+			}
+		}
+	}
+	b.Sel = sel[:n]
+}
+
+func applyFloatCmp(x float64, cmp Cmp, v float64) bool {
+	switch cmp {
+	case Eq:
+		return x == v
+	case Ne:
+		return x != v
+	case Gt:
+		return x > v
+	case Ge:
+		return x >= v
+	case Lt:
+		return x < v
+	case Le:
+		return x <= v
+	}
+	return false
+}
+
+func filterStringInto(b *Batch, c *Column, cmp Cmp, v string) {
+	data := c.Strings
+	eq := cmp == Eq
+	if b.Sel == nil {
+		// First-mismatch scan, as in filterInt64Into: all-match costs zero
+		// allocs and leaves Sel == nil.
+		match := func(r int) bool { return (data[r] == v) == eq }
+		if len(c.Nulls) == 0 {
+			miss := -1
+			for r := 0; r < b.NumRows; r++ {
+				if !match(r) {
+					miss = r
+					break
+				}
+			}
+			if miss < 0 {
+				return
+			}
+			out := make([]int32, 0, b.NumRows)
+			for r := 0; r < miss; r++ {
+				out = append(out, int32(r))
+			}
+			for r := miss + 1; r < b.NumRows; r++ {
+				if match(r) {
+					out = append(out, int32(r))
+				}
+			}
+			if len(out) == 0 {
+				out = []int32{}
+			}
+			b.Sel = out
+			return
+		}
+		nulls := c.Nulls
+		miss := -1
+		for r := 0; r < b.NumRows; r++ {
+			if nulls[r] || !match(r) {
+				miss = r
+				break
+			}
+		}
+		if miss < 0 {
+			return
+		}
+		out := make([]int32, 0, b.NumRows)
+		for r := 0; r < miss; r++ {
+			out = append(out, int32(r))
+		}
+		for r := miss + 1; r < b.NumRows; r++ {
+			if !nulls[r] && match(r) {
+				out = append(out, int32(r))
+			}
+		}
+		if len(out) == 0 {
+			out = []int32{}
+		}
+		b.Sel = out
+		return
+	}
+	sel := b.Sel
+	n := 0
+	if len(c.Nulls) == 0 {
+		for _, s := range sel {
+			if (data[int(s)] == v) == eq {
+				sel[n] = s
+				n++
+			}
+		}
+	} else {
+		nulls := c.Nulls
+		for _, s := range sel {
+			if !nulls[int(s)] && (data[int(s)] == v) == eq {
+				sel[n] = s
+				n++
+			}
+		}
+	}
+	b.Sel = sel[:n]
+}
+
+func filterBoolInto(b *Batch, c *Column, v bool) {
+	data := c.Bools
+	if b.Sel == nil {
+		// First-mismatch scan, as in filterInt64Into: all-match costs zero
+		// allocs and leaves Sel == nil.
+		if len(c.Nulls) == 0 {
+			miss := -1
+			for r := 0; r < b.NumRows; r++ {
+				if data[r] != v {
+					miss = r
+					break
+				}
+			}
+			if miss < 0 {
+				return
+			}
+			out := make([]int32, 0, b.NumRows)
+			for r := 0; r < miss; r++ {
+				out = append(out, int32(r))
+			}
+			for r := miss + 1; r < b.NumRows; r++ {
+				if data[r] == v {
+					out = append(out, int32(r))
+				}
+			}
+			if len(out) == 0 {
+				out = []int32{}
+			}
+			b.Sel = out
+			return
+		}
+		nulls := c.Nulls
+		miss := -1
+		for r := 0; r < b.NumRows; r++ {
+			if nulls[r] || data[r] != v {
+				miss = r
+				break
+			}
+		}
+		if miss < 0 {
+			return
+		}
+		out := make([]int32, 0, b.NumRows)
+		for r := 0; r < miss; r++ {
+			out = append(out, int32(r))
+		}
+		for r := miss + 1; r < b.NumRows; r++ {
+			if !nulls[r] && data[r] == v {
+				out = append(out, int32(r))
+			}
+		}
+		if len(out) == 0 {
+			out = []int32{}
+		}
+		b.Sel = out
+		return
+	}
+	sel := b.Sel
+	n := 0
+	if len(c.Nulls) == 0 {
+		for _, s := range sel {
+			if data[int(s)] == v {
+				sel[n] = s
+				n++
+			}
+		}
+	} else {
+		nulls := c.Nulls
+		for _, s := range sel {
+			if !nulls[int(s)] && data[int(s)] == v {
+				sel[n] = s
+				n++
+			}
+		}
+	}
+	b.Sel = sel[:n]
+}
+
+// Project keeps a subset of columns, in the given order. Indices refer to
+// positions in the input batch; duplicates are allowed. Projection is a
+// header-only operation — no per-row loop, typed or otherwise — so there
+// is nothing to specialize: the output shares the input's backing arrays
+// and selection.
+type Project struct {
+	Indices []int
+}
+
+// NewProject builds a Project keeping the given column indices.
+func NewProject(indices ...int) *Project {
+	return &Project{Indices: indices}
+}
+
+// Process returns a batch with only the projected columns.
+func (op *Project) Process(b *Batch) (*Batch, error) {
+	if b == nil {
+		return nil, fmt.Errorf("vector: project: nil batch")
+	}
+	if len(op.Indices) == 0 {
+		return nil, fmt.Errorf("vector: project: no columns selected")
+	}
+	if err := b.Validate(); err != nil {
+		return nil, fmt.Errorf("vector: project: %w", err)
+	}
+	for _, idx := range op.Indices {
+		if idx < 0 || idx >= len(b.Columns) {
+			return nil, fmt.Errorf("vector: project: column index %d out of range (have %d columns)", idx, len(b.Columns))
+		}
+	}
+	out := &Batch{
+		Schema:  engine.Schema{Fields: make([]engine.Field, len(op.Indices))},
+		Columns: make([]Column, len(op.Indices)),
+		NumRows: b.NumRows,
+		Sel:     b.Sel,
+	}
+	for i, idx := range op.Indices {
+		out.Schema.Fields[i] = b.Schema.Fields[idx]
+		out.Columns[i] = b.Columns[idx]
+	}
+	return out, nil
+}
+
+// FilterProject fuses a single Filter with a Project into one operator:
+// one pass over the filter column, one batch header allocated. Use it
+// wherever a query filters and then narrows columns (Q2's f > 0.5 plus
+// project (id, f)) — the sequential Filter-then-Project would do two
+// passes and two headers for the same result.
+type FilterProject struct {
+	Filter  *Filter
+	Indices []int
+}
+
+// NewFilterFloat64GTProject builds the fused Q2-shaped operator: keep
+// rows where float column filterCol > threshold, then keep indices.
+func NewFilterFloat64GTProject(filterCol int, threshold float64, indices ...int) *FilterProject {
+	return &FilterProject{Filter: NewFloat64Filter(filterCol, Gt, threshold), Indices: indices}
+}
+
+// Process runs the filter in place, then projects the survivors.
+func (op *FilterProject) Process(b *Batch) (*Batch, error) {
+	if op.Filter == nil {
+		return nil, fmt.Errorf("vector: filter-project: nil filter")
+	}
+	filtered, err := op.Filter.Process(b)
+	if err != nil {
+		return nil, err
+	}
+	return (&Project{Indices: op.Indices}).Process(filtered)
+}

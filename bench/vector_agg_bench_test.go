@@ -68,13 +68,17 @@ func memBatches() []*vector.Batch {
 }
 
 var (
-	sinkGlobal vector.GlobalResult
-	sinkGroups int
+	sinkGlobal  vector.GlobalResult
+	sinkGroups  int
+	sinkIntRows []vector.Int64Group
+	sinkStrRows []vector.StringGroup
 )
 
 // driveMem times fn per iteration and reports scanned rows/s over the
 // resident 1M rows. batches is the shared read-only fixture: fn must not
-// filter or otherwise mutate it (see aggMemBatches).
+// filter or otherwise mutate it (see aggMemBatches). Group benches fold
+// plus materialize SortedRows so output cost lands symmetrically with
+// driveDuckDBMem, which Scan-decodes every output row.
 func driveMem(b *testing.B, fn func() error) {
 	b.Helper()
 	batches := memBatches()
@@ -115,7 +119,8 @@ func BenchmarkVectorGroupBy128Mem(b *testing.B) {
 				return err
 			}
 		}
-		sinkGroups = g.Len()
+		sinkIntRows = g.SortedRows()
+		sinkGroups = len(sinkIntRows)
 		return nil
 	})
 }
@@ -129,7 +134,8 @@ func BenchmarkVectorGroupBy100KMem(b *testing.B) {
 				return err
 			}
 		}
-		sinkGroups = g.Len()
+		sinkIntRows = g.SortedRows()
+		sinkGroups = len(sinkIntRows)
 		return nil
 	})
 }
@@ -143,7 +149,8 @@ func BenchmarkVectorGroupByString1KMem(b *testing.B) {
 				return err
 			}
 		}
-		sinkGroups = g.Len()
+		sinkStrRows = g.SortedRows()
+		sinkGroups = len(sinkStrRows)
 		return nil
 	})
 }
@@ -157,7 +164,8 @@ func driveParGroup128(b *testing.B, workers int) {
 		if err != nil {
 			return err
 		}
-		sinkGroups = g.Len()
+		sinkIntRows = g.SortedRows()
+		sinkGroups = len(sinkIntRows)
 		return nil
 	})
 }

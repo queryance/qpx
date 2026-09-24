@@ -158,3 +158,163 @@ func driveParGroup128(b *testing.B, workers int) {
 			return err
 		}
 		sinkGroups = g.Len()
+		return nil
+	})
+}
+
+func BenchmarkVectorParGroup128W1(b *testing.B)  { driveParGroup128(b, 1) }
+func BenchmarkVectorParGroup128W2(b *testing.B)  { driveParGroup128(b, 2) }
+func BenchmarkVectorParGroup128W4(b *testing.B)  { driveParGroup128(b, 4) }
+func BenchmarkVectorParGroup128W8(b *testing.B)  { driveParGroup128(b, 8) }
+func BenchmarkVectorParGroup128W16(b *testing.B) { driveParGroup128(b, 16) }
+
+// openDuckDBMem opens an in-memory DuckDB (no postgres extension) with a
+// resident table m matching the memBatches distribution, generated via
+// range. Setup cost is hoisted out of the timed loop by driveDuckDBMem.
+func openDuckDBMem(ctx context.Context) (*duckDB, error) {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		return nil, fmt.Errorf("bench: duckdb open: %w", err)
+	}
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("bench: duckdb conn: %w", err)
+	}
+	const ddl = `CREATE TABLE m AS SELECT (r+1) AS id,` +
+		` ((r+1) % 100000)::DOUBLE/100000.0 AS f,` +
+		` 'txt_'||((r+1)%1000) AS t FROM range(1000000) t(r)`
+	if _, err := conn.ExecContext(ctx, ddl); err != nil {
+		_ = conn.Close()
+		_ = db.Close()
+		return nil, fmt.Errorf("bench: duckdb build m: %w", err)
+	}
+	return &duckDB{db: db, conn: conn}, nil
+}
+
+// DuckDB over a resident table with the same distribution, generated via
+// range (no PG). Setup (open + CREATE) is hoisted out of the timed loop;
+// each iteration runs the query and Scan-decodes every output row.
+func driveDuckDBMem(b *testing.B, sql string) {
+	b.Helper()
+	ctx := context.Background()
+	db, err := openDuckDBMem(ctx)
+	if err != nil {
+		b.Fatalf("duckdb setup: %v", err)
+	}
+	defer db.close()
+	if _, err := db.runQuery(ctx, sql); err != nil {
+		b.Fatalf("warmup: %v", err)
+	}
+	b.ResetTimer()
+	var total int64
+	for i := 0; i < b.N; i++ {
+		n, err := db.runQuery(ctx, sql)
+		if err != nil {
+			b.Fatalf("iter %d: %v", i, err)
+		}
+		total += n
+	}
+	sec := b.Elapsed().Seconds()
+	b.ReportMetric(float64(int64(b.N)*1_000_000)/sec, "scan_rows/s")
+	b.ReportMetric(float64(total)/float64(b.N), "rows/op")
+}
+
+func BenchmarkDuckDBAggGlobalMem(b *testing.B) {
+	driveDuckDBMem(b, `SELECT count(*), sum(f), avg(f) FROM m`)
+}
+func BenchmarkDuckDBGroupBy128Mem(b *testing.B) {
+	driveDuckDBMem(b, `SELECT (id % 128) AS g, count(*), avg(f) FROM m GROUP BY 1`)
+}
+func BenchmarkDuckDBGroupBy100KMem(b *testing.B) {
+	driveDuckDBMem(b, `SELECT (id % 100000) AS g, count(*), avg(f) FROM m GROUP BY 1`)
+}
+func BenchmarkDuckDBGroupByString1KMem(b *testing.B) {
+	driveDuckDBMem(b, `SELECT t, count(*), avg(f) FROM m GROUP BY 1`)
+}
+
+// Live PG worker sweep for the vector path: scan (no ops) mirrors
+// BenchmarkMxQPXW*Scan on the same sqlQ1. The fused filter+project sweep
+// below (sqlQ2FullScan, engine-side filter) does NOT mirror
+// BenchmarkMxQPXW*Filter (sqlQ2, PG-side WHERE): compare legacy Filter
+// against BenchmarkVectorW*PGFilter instead.
+func runVectorWorkers(ctx context.Context, sql string, workers int, ops []vector.Operator) (int64, error) {
+	src := postgres.NewVectorSource(postgres.Config{ConnString: resolveDSN(), SQL: sql})
+	opts := qpx.DefaultVectorOptions()
+	opts.Workers = workers
+	opts.Ops = ops
+	it, err := qpx.ExecuteVector(ctx, src, opts)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = it.Close() }()
+	var rows int64
+	for {
+		bh, ok, err := it.Next(ctx)
+		if err != nil {
+			return rows, err
+		}
+		if !ok {
+			return rows, nil
+		}
+		rows += int64(bh.Len())
+	}
+}
+
+func mxDriveVectorWorkers(b *testing.B, sql string, workers int, ops []vector.Operator) {
+	b.Helper()
+	driveMatrix(b, sql, benchRows, func(ctx context.Context, s string) (int64, error) {
+		return runVectorWorkers(ctx, s, workers, ops)
+	})
+}
+
+func BenchmarkVectorW1Scan(b *testing.B)  { mxDriveVectorWorkers(b, sqlQ1, 1, nil) }
+func BenchmarkVectorW2Scan(b *testing.B)  { mxDriveVectorWorkers(b, sqlQ1, 2, nil) }
+func BenchmarkVectorW4Scan(b *testing.B)  { mxDriveVectorWorkers(b, sqlQ1, 4, nil) }
+func BenchmarkVectorW8Scan(b *testing.B)  { mxDriveVectorWorkers(b, sqlQ1, 8, nil) }
+func BenchmarkVectorW16Scan(b *testing.B) { mxDriveVectorWorkers(b, sqlQ1, 16, nil) }
+
+// Engine-side filter+project sweep: full 1M-row scan with the fused
+// f>0.5 filter running in the workers. NOT head-to-head with
+// BenchmarkMxQPXW*Filter (PG-side WHERE, ~500k rows out of PG): different
+// scan work and different filter location. For a direct worker comparison
+// against the legacy path, see BenchmarkVectorW*PGFilter below, which
+// drains the PG-filtered sqlQ2 with no engine ops.
+func BenchmarkVectorW1EngineFilter(b *testing.B) {
+	mxDriveVectorWorkers(b, sqlQ2FullScan, 1, []vector.Operator{vector.NewFilterFloat64GTProject(1, 0.5, 0, 1)})
+}
+func BenchmarkVectorW2EngineFilter(b *testing.B) {
+	mxDriveVectorWorkers(b, sqlQ2FullScan, 2, []vector.Operator{vector.NewFilterFloat64GTProject(1, 0.5, 0, 1)})
+}
+func BenchmarkVectorW4EngineFilter(b *testing.B) {
+	mxDriveVectorWorkers(b, sqlQ2FullScan, 4, []vector.Operator{vector.NewFilterFloat64GTProject(1, 0.5, 0, 1)})
+}
+func BenchmarkVectorW8EngineFilter(b *testing.B) {
+	mxDriveVectorWorkers(b, sqlQ2FullScan, 8, []vector.Operator{vector.NewFilterFloat64GTProject(1, 0.5, 0, 1)})
+}
+func BenchmarkVectorW16EngineFilter(b *testing.B) {
+	mxDriveVectorWorkers(b, sqlQ2FullScan, 16, []vector.Operator{vector.NewFilterFloat64GTProject(1, 0.5, 0, 1)})
+}
+
+// PG-filtered sweep: same sqlQ2 (PG-side WHERE) as BenchmarkMxQPXW*Filter,
+// drained through the vector path with no engine ops — the head-to-head
+// worker comparison. Pair with BenchmarkVectorW*EngineFilter (full scan,
+// engine-side filter) to separate scan/filter placement effects.
+func BenchmarkVectorW1PGFilter(b *testing.B)  { mxDriveVectorWorkers(b, sqlQ2, 1, nil) }
+func BenchmarkVectorW2PGFilter(b *testing.B)  { mxDriveVectorWorkers(b, sqlQ2, 2, nil) }
+func BenchmarkVectorW4PGFilter(b *testing.B)  { mxDriveVectorWorkers(b, sqlQ2, 4, nil) }
+func BenchmarkVectorW8PGFilter(b *testing.B)  { mxDriveVectorWorkers(b, sqlQ2, 8, nil) }
+func BenchmarkVectorW16PGFilter(b *testing.B) { mxDriveVectorWorkers(b, sqlQ2, 16, nil) }
+
+// Live engine-side group-by: full scan of (id, f) with per-batch folds
+// into one GroupByInt64. Compare against BenchmarkQPXQ3GroupBy, where PG
+// aggregates and QPX drains 128 rows.
+func runVectorGroupBy128PG(ctx context.Context) (int64, error) {
+	src := postgres.NewVectorSource(postgres.Config{ConnString: resolveDSN(), SQL: `SELECT id, f FROM qpx_bench_data`})
+	it, err := qpx.ExecuteVector(ctx, src, qpx.DefaultVectorOptions())
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = it.Close() }()
+	g := vector.NewGroupByInt64(0, 1, 128)
+	for {

@@ -1,0 +1,10 @@
+# compiled test binaries
+*.test
+/bench.test
+
+# Go build and test artifacts
+*.out
+*.prof
+
+# macOS
+.DS_Store

@@ -168,3 +168,175 @@ func canon(v any) string {
 	case float64:
 		return strconv.FormatFloat(n, 'g', -1, 64)
 	case float32:
+		return strconv.FormatFloat(float64(n), 'g', -1, 32)
+	case string:
+		return strconv.Quote(n)
+	case bool:
+		if n {
+			return "true"
+		}
+		return "false"
+	case []byte:
+		return fmt.Sprintf("%x", n)
+	case time.Time:
+		return n.UTC().Format(time.RFC3339Nano)
+	case pgtype.Numeric:
+		// Canonical float form: the vector path stores numeric text,
+		// pgx Values() yields the struct — both reduce to the same
+		// float64 so the three systems compare exactly.
+		if !n.Valid {
+			return "NULL"
+		}
+		f, err := n.Float64Value()
+		if err != nil {
+			return fmt.Sprintf("bad-numeric:%v", err)
+		}
+		return strconv.FormatFloat(f.Float64, 'g', -1, 64)
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+func pgCanonical(t *testing.T, ctx context.Context, dsn, sql string) []string {
+	t.Helper()
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	rows, err := conn.Query(ctx, sql)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		vals, err := rows.Values()
+		if err != nil {
+			t.Fatalf("Values: %v", err)
+		}
+		s := ""
+		for i, v := range vals {
+			if i > 0 {
+				s += "|"
+			}
+			s += canon(v)
+		}
+		out = append(out, s)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	return out
+}
+
+func legacyCanonical(t *testing.T, ctx context.Context, dsn, sql string) []string {
+	t.Helper()
+	src := postgres.NewSource(postgres.Config{ConnString: dsn, SQL: sql})
+	it, err := qpx.Execute(ctx, src, qpx.DefaultExecuteOptions())
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	defer func() { _ = it.Close() }()
+	var out []string
+	for {
+		c, ok, err := it.Next(ctx)
+		if err != nil {
+			t.Fatalf("Next: %v", err)
+		}
+		if !ok {
+			break
+		}
+		for i := 0; i < c.NumRows(); i++ {
+			s := ""
+			for j := range c.Columns {
+				if j > 0 {
+					s += "|"
+				}
+				s += canon(c.Columns[j][i])
+			}
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func batchCanonical(b *vector.Batch) []string {
+	out := make([]string, 0, b.Len())
+	for i := 0; i < b.Len(); i++ {
+		r := i
+		if b.Sel != nil {
+			r = int(b.Sel[i])
+		}
+		s := ""
+		for j := range b.Columns {
+			if j > 0 {
+				s += "|"
+			}
+			c := &b.Columns[j]
+			if c.IsNull(r) {
+				s += "NULL"
+				continue
+			}
+			switch c.Type {
+			case engine.Int64:
+				s += canon(c.Ints[r])
+			case engine.Float64:
+				s += canon(c.Floats[r])
+			case engine.Bool:
+				s += canon(c.Bools[r])
+			case engine.String:
+				s += canon(c.Strings[r])
+			case engine.Bytes:
+				s += canon(c.Bytes[r])
+			case engine.Time:
+				s += canon(c.Times[r])
+			case engine.Numeric:
+				f, err := strconv.ParseFloat(c.Numerics[r], 64)
+				if err != nil {
+					s += "bad-numeric:" + c.Numerics[r]
+				} else {
+					s += strconv.FormatFloat(f, 'g', -1, 64)
+				}
+			default:
+				s += canon(c.Strings[r])
+			}
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+func vectorCanonical(t *testing.T, ctx context.Context, dsn, sql string) []string {
+	t.Helper()
+	src := postgres.NewVectorSource(postgres.Config{ConnString: dsn, SQL: sql})
+	it, err := qpx.ExecuteVector(ctx, src, qpx.DefaultVectorOptions())
+	if err != nil {
+		t.Fatalf("ExecuteVector: %v", err)
+	}
+	defer func() { _ = it.Close() }()
+	var out []string
+	for {
+		b, ok, err := it.Next(ctx)
+		if err != nil {
+			t.Fatalf("Next: %v", err)
+		}
+		if !ok {
+			break
+		}
+		out = append(out, batchCanonical(b)...)
+	}
+	return out
+}
+
+func compareCanonical(t *testing.T, name string, want, got []string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("%s: got %d rows, want %d", name, len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("%s: row %d differs:\n got %s\nwant %s", name, i, got[i], want[i])
+		}
+	}
+}

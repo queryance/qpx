@@ -218,3 +218,220 @@ func TestProjectOp(t *testing.T) {
 	if _, err := engine.NewProjectOp().Process(makeChunk(1)); err == nil {
 		t.Fatal("empty projection must fail")
 	}
+	if _, err := engine.NewProjectOp(5).Process(makeChunk(1)); err == nil {
+		t.Fatal("out-of-range index must fail")
+	}
+}
+
+func TestSchedulerOrderedMerge(t *testing.T) {
+	// One row per chunk; a delay op completes later chunks first, so
+	// output order proves sequence-numbered reassembly.
+	var chunks []engine.Chunk
+	for i := 0; i < 64; i++ {
+		chunks = append(chunks, makeChunk(i))
+	}
+	src := &fakeSource{schema: testSchema, chunks: chunks, errAfter: -1}
+	var maxInFlight atomic.Int64
+	var inFlight atomic.Int64
+	delay := &funcOp{fn: func(c engine.Chunk) (engine.Chunk, error) {
+		id := c.Columns[0][0].(int64)
+		cur := inFlight.Add(1)
+		for {
+			m := maxInFlight.Load()
+			if cur <= m || maxInFlight.CompareAndSwap(m, cur) {
+				break
+			}
+		}
+		defer inFlight.Add(-1)
+		time.Sleep(time.Duration(63-id) * 100 * time.Microsecond)
+		return c, nil
+	}}
+	got, err := run(t, src, []engine.Operator{delay})
+	if err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if maxInFlight.Load() < 2 {
+		t.Fatalf("expected concurrent processing, max in flight %d", maxInFlight.Load())
+	}
+	if len(got) != 64 {
+		t.Fatalf("got %d chunks, want 64", len(got))
+	}
+	for i, c := range got {
+		if id := c.Columns[0][0].(int64); id != int64(i) {
+			t.Fatalf("chunk %d out of order: id=%d", i, id)
+		}
+	}
+}
+
+func TestSchedulerFilterProjectPipeline(t *testing.T) {
+	src := &fakeSource{schema: testSchema, chunks: []engine.Chunk{makeChunk(1, 2, 3, 4)}, errAfter: -1}
+	filter := engine.NewFilterOp(func(row []any) (bool, error) { return row[0].(int64) > 1, nil })
+	got, err := run(t, src, []engine.Operator{filter, engine.NewProjectOp(0)})
+	if err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if len(got) != 1 || len(got[0].Schema.Fields) != 1 {
+		t.Fatalf("unexpected pipeline output: %+v", got)
+	}
+	if ids := col0(got[0]); len(ids) != 3 || ids[0] != 2 {
+		t.Fatalf("unexpected rows: %v", ids)
+	}
+}
+
+func TestSchedulerErrorPropagation(t *testing.T) {
+	src := &fakeSource{schema: testSchema, chunks: []engine.Chunk{makeChunk(1), makeChunk(2)}, errAfter: -1}
+	wantErr := errors.New("op boom")
+	bad := &funcOp{fn: func(c engine.Chunk) (engine.Chunk, error) {
+		if c.Columns[0][0].(int64) == 2 {
+			return engine.Chunk{}, wantErr
+		}
+		return c, nil
+	}}
+	_, err := run(t, src, []engine.Operator{bad})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("want wrapped op error, got %v", err)
+	}
+}
+
+func TestSchedulerScanError(t *testing.T) {
+	src := &fakeSource{schema: testSchema, chunks: []engine.Chunk{makeChunk(1)}, errAfter: 1}
+	_, err := run(t, src, nil)
+	if err == nil || err.Error() == "" {
+		t.Fatal("want scan error, got nil")
+	}
+}
+
+func TestSchedulerOpenError(t *testing.T) {
+	src := &fakeSource{openErr: errors.New("cannot open")}
+	sched := engine.Scheduler{}
+	if _, _, err := sched.Run(context.Background(), src, nil); err == nil {
+		t.Fatal("want open error, got nil")
+	}
+}
+
+func TestSchedulerCancellation(t *testing.T) {
+	src := &fakeSource{schema: testSchema, chunks: []engine.Chunk{makeChunk(1)}, errAfter: -1}
+	sched := engine.Scheduler{Workers: 2, QueueSize: 1}
+	ctx, cancel := context.WithCancel(context.Background())
+	chunks, errCh, err := sched.Run(ctx, src, []engine.Operator{&funcOp{fn: func(c engine.Chunk) (engine.Chunk, error) {
+		time.Sleep(50 * time.Millisecond)
+		return c, nil
+	}}})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	cancel()
+	timeout := time.After(5 * time.Second)
+	for {
+		select {
+		case _, ok := <-chunks:
+			if !ok {
+				select {
+				case <-errCh:
+				case <-timeout:
+					t.Fatal("errCh not closed after cancel")
+				}
+				return
+			}
+		case <-timeout:
+			t.Fatal("chunk channel not closed after cancel: goroutine leak")
+		}
+	}
+}
+
+func TestSchedulerCancellationSurfacesError(t *testing.T) {
+	var chunks []engine.Chunk
+	for i := 0; i < 64; i++ {
+		chunks = append(chunks, makeChunk(i))
+	}
+	src := &fakeSource{schema: testSchema, chunks: chunks, errAfter: -1}
+	sched := engine.Scheduler{Workers: 2, QueueSize: 1}
+	ctx, cancel := context.WithCancel(context.Background())
+	block := &funcOp{fn: func(c engine.Chunk) (engine.Chunk, error) {
+		time.Sleep(50 * time.Millisecond)
+		return c, nil
+	}}
+	out, errCh, err := sched.Run(ctx, src, []engine.Operator{block})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	it := engine.NewIterator(out, errCh, cancel)
+	// Cancel the run context externally; the drained Iterator must surface
+	// a wrapped context.Canceled instead of a clean EOF.
+	cancel()
+	var term error
+	for {
+		_, ok, err := it.Next(context.Background())
+		if err != nil {
+			term = err
+			break
+		}
+		if !ok {
+			break
+		}
+	}
+	if term == nil {
+		// The error may arrive as the terminal Next error after chunks drain;
+		// drain once more to be sure we observed it.
+		_, _, term = it.Next(context.Background())
+	}
+	if !errors.Is(term, context.Canceled) {
+		t.Fatalf("cancelled run must surface context.Canceled, got %v", term)
+	}
+}
+
+func TestIteratorCloseIdempotent(t *testing.T) {
+	src := &fakeSource{schema: testSchema, chunks: []engine.Chunk{makeChunk(1)}, errAfter: -1}
+	sched := engine.Scheduler{}
+	chunks, errCh, err := sched.Run(context.Background(), src, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	it := engine.NewIterator(chunks, errCh, nil)
+	if err := it.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := it.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if _, ok, _ := it.Next(context.Background()); ok {
+		t.Fatal("Next after Close should report done")
+	}
+}
+
+func TestIteratorCloseDoesNotStarve(t *testing.T) {
+	chunks := make(chan engine.Chunk)
+	errCh := make(chan error)
+	it := engine.NewIterator(chunks, errCh, func() {})
+	nextDone := make(chan struct{})
+	go func() {
+		defer close(nextDone)
+		_, _, _ = it.Next(context.Background())
+	}()
+	// Let Next block in select (outside the lock after the fix).
+	time.Sleep(50 * time.Millisecond)
+	closeDone := make(chan struct{})
+	go func() {
+		defer close(closeDone)
+		_ = it.Close()
+	}()
+	select {
+	case <-closeDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close starved by blocked Next: holds mu across select")
+	}
+	// Unblock the waiting Next and let it finish.
+	close(chunks)
+	close(errCh)
+	select {
+	case <-nextDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocked Next did not finish after channels closed")
+	}
+}
+
+type funcOp struct {
+	fn func(engine.Chunk) (engine.Chunk, error)
+}
+
+func (o *funcOp) Process(c engine.Chunk) (engine.Chunk, error) { return o.fn(c) }

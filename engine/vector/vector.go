@@ -118,3 +118,120 @@ func (b *Batch) Reset() {
 		default:
 			c.Strings = c.Strings[:0]
 		}
+		// Same pin-avoidance for strings: headers are values, but the
+		// backing bytes are referenced by them; dropping the headers is
+		// enough, no per-element clearing needed.
+		c.Nulls = c.Nulls[:0]
+		c.HasNulls = false
+	}
+	b.NumRows = 0
+	// Drop, not [:0]: Len must return NumRows (not 0) for a refilled
+	// dense batch, so empty-but-non-nil would be ambiguous. The next
+	// filter allocates a fresh Sel; at ~1 alloc per batch this is noise.
+	b.Sel = nil
+}
+
+// Validate enforces the rectangular invariant: one column per field,
+// every active slice (and non-empty Nulls) exactly NumRows long, Sel
+// indexes in range.
+func (b *Batch) Validate() error {
+	if len(b.Columns) != len(b.Schema.Fields) {
+		return fmt.Errorf("vector: column count %d != field count %d", len(b.Columns), len(b.Schema.Fields))
+	}
+	for i := range b.Columns {
+		c := &b.Columns[i]
+		want := c.Type
+		if got := b.Schema.Fields[i].Type; got != want {
+			return fmt.Errorf("vector: column %d type %v != schema %v", i, want, got)
+		}
+		if n := c.Len(); n != b.NumRows {
+			return fmt.Errorf("vector: column %d has %d rows, want %d", i, n, b.NumRows)
+		}
+		if len(c.Nulls) != 0 && len(c.Nulls) != b.NumRows {
+			return fmt.Errorf("vector: column %d null bitmap %d != %d rows", i, len(c.Nulls), b.NumRows)
+		}
+	}
+	for _, s := range b.Sel {
+		if s < 0 || int(s) >= b.NumRows {
+			return fmt.Errorf("vector: selection index %d out of range (%d rows)", s, b.NumRows)
+		}
+	}
+	return nil
+}
+
+// Len reports the physical row count of the column's active slice.
+func (c *Column) Len() int {
+	switch c.Type {
+	case engine.Int64:
+		return len(c.Ints)
+	case engine.Float64:
+		return len(c.Floats)
+	case engine.Bool:
+		return len(c.Bools)
+	case engine.String:
+		return len(c.Strings)
+	case engine.Bytes:
+		return len(c.Bytes)
+	case engine.Time:
+		return len(c.Times)
+	case engine.Numeric:
+		return len(c.Numerics)
+	default:
+		return len(c.Strings)
+	}
+}
+
+// AppendNull records a SQL NULL: a zero value on the active slice plus a
+// true bit. Nulls stays nil until the first null so dense non-null data
+// pays no bitmap cost at all.
+func (c *Column) AppendNull() {
+	n := c.Len()
+	if len(c.Nulls) == 0 {
+		c.Nulls = make([]bool, n+1)
+	} else {
+		c.Nulls = append(c.Nulls, false)
+	}
+	c.Nulls[n] = true
+	c.HasNulls = true
+	switch c.Type {
+	case engine.Int64:
+		c.Ints = append(c.Ints, 0)
+	case engine.Float64:
+		c.Floats = append(c.Floats, 0)
+	case engine.Bool:
+		c.Bools = append(c.Bools, false)
+	case engine.String:
+		c.Strings = append(c.Strings, "")
+	case engine.Bytes:
+		c.Bytes = append(c.Bytes, nil)
+	case engine.Time:
+		c.Times = append(c.Times, time.Time{})
+	case engine.Numeric:
+		c.Numerics = append(c.Numerics, "")
+	default:
+		c.Strings = append(c.Strings, "")
+	}
+}
+
+// IsNull reports whether physical row r is SQL NULL.
+func (c *Column) IsNull(r int) bool {
+	return len(c.Nulls) > 0 && c.Nulls[r]
+}
+
+// Typed appends maintain the null bitmap: once a column HasNulls every
+// subsequent value — null or not — extends Nulls, so len(Nulls) is always
+// 0 or the row count (Validate enforces this). Prefer these over raw
+// slice appends whenever a column may hold NULLs; the branch is
+// perfectly predicted for dense NOT NULL data.
+func (c *Column) AppendInt(v int64)      { c.Ints = append(c.Ints, v); c.extendNull() }
+func (c *Column) AppendFloat(v float64)  { c.Floats = append(c.Floats, v); c.extendNull() }
+func (c *Column) AppendBool(v bool)      { c.Bools = append(c.Bools, v); c.extendNull() }
+func (c *Column) AppendString(v string)  { c.Strings = append(c.Strings, v); c.extendNull() }
+func (c *Column) AppendBytes(v []byte)   { c.Bytes = append(c.Bytes, v); c.extendNull() }
+func (c *Column) AppendTime(v time.Time) { c.Times = append(c.Times, v); c.extendNull() }
+func (c *Column) AppendNumeric(v string) { c.Numerics = append(c.Numerics, v); c.extendNull() }
+func (c *Column) extendNull() {
+	if c.HasNulls {
+		c.Nulls = append(c.Nulls, false)
+	}
+}

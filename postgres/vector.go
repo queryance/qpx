@@ -288,3 +288,148 @@ func decodeInt(buf []byte, format int16) (int64, error) {
 // decodeFloat handles binary float4/float8 and text floats.
 func decodeFloat(buf []byte, format int16) (float64, error) {
 	if format == pgtype.BinaryFormatCode {
+		switch len(buf) {
+		case 4:
+			return float64(math.Float32frombits(binary.BigEndian.Uint32(buf))), nil
+		case 8:
+			return math.Float64frombits(binary.BigEndian.Uint64(buf)), nil
+		default:
+			return 0, fmt.Errorf("float: binary length %d", len(buf))
+		}
+	}
+	v, err := strconv.ParseFloat(string(buf), 64)
+	if err != nil {
+		return 0, fmt.Errorf("float: %w", err)
+	}
+	return v, nil
+}
+
+// decodeBool handles binary (1 byte) and text ('t'/'f', extended forms).
+func decodeBool(buf []byte, format int16) (bool, error) {
+	if format == pgtype.BinaryFormatCode {
+		if len(buf) != 1 {
+			return false, fmt.Errorf("bool: binary length %d", len(buf))
+		}
+		return buf[0] != 0, nil
+	}
+	switch string(buf) {
+	case "t", "true", "1":
+		return true, nil
+	case "f", "false", "0":
+		return false, nil
+	default:
+		return false, fmt.Errorf("bool: unrecognized %q", buf)
+	}
+}
+
+// decodeString copies text bytes. Binary payloads of the text family
+// (text/varchar/name/bpchar) are raw bytes too; any other binary OID
+// goes through pgtype text coercion, else an explicit error.
+func (sc *vscanner) decodeString(buf []byte, m *colMeta) (string, error) {
+	if m.format == pgtype.TextFormatCode {
+		return string(buf), nil
+	}
+	switch m.oid {
+	case pgtype.TextOID, pgtype.VarcharOID, pgtype.NameOID, pgtype.BPCharOID:
+		return string(buf), nil
+	}
+	var t pgtype.Text
+	if err := sc.fallMap.Scan(m.oid, m.format, buf, &t); err != nil {
+		return "", fmt.Errorf("string OID %d: %w (use legacy Source)", m.oid, err)
+	}
+	if !t.Valid {
+		return "", fmt.Errorf("string OID %d: unexpected NULL decode", m.oid)
+	}
+	return t.String, nil
+}
+
+// decodeBytes clones binary payloads (RawValues is only valid until the
+// next Next). Text bytea arrives hex-encoded (\x...); decode the prefix,
+// else keep the raw copy.
+func decodeBytes(buf []byte, format int16) ([]byte, error) {
+	if format == pgtype.BinaryFormatCode {
+		out := make([]byte, len(buf))
+		copy(out, buf)
+		return out, nil
+	}
+	if len(buf) >= 2 && buf[0] == '\\' && (buf[1] == 'x' || buf[1] == 'X') {
+		out := make([]byte, hex.DecodedLen(len(buf)-2))
+		if _, err := hex.Decode(out, buf[2:]); err != nil {
+			return nil, fmt.Errorf("bytea hex: %w", err)
+		}
+		return out, nil
+	}
+	out := make([]byte, len(buf))
+	copy(out, buf)
+	return out, nil
+}
+
+// Decode timestamps. Binary timestamp/timestamptz is int64 micros since
+// 2000-01-01, converted with pgx's exact formula so vector times are
+// bit-identical to legacy Values() times. Binary date is int32 days since
+// 2000-01-01. Anything else (text forms) goes through pgtype into
+// time.Time. Infinities have no time.Time form and are an explicit error.
+func (sc *vscanner) decodeTime(buf []byte, m *colMeta) (time.Time, error) {
+	if m.format == pgtype.BinaryFormatCode {
+		switch m.oid {
+		case pgtype.DateOID:
+			if len(buf) != 4 {
+				return time.Time{}, fmt.Errorf("date: binary length %d", len(buf))
+			}
+			days := int64(int32(binary.BigEndian.Uint32(buf)))
+			if days == 2147483647 || days == -2147483648 {
+				return time.Time{}, fmt.Errorf("date: infinity unsupported in vector Time")
+			}
+			return time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC).AddDate(0, 0, int(days)), nil
+		case pgtype.TimestampOID, pgtype.TimestamptzOID:
+			if len(buf) != 8 {
+				return time.Time{}, fmt.Errorf("timestamp: binary length %d", len(buf))
+			}
+			return decodeMicrosY2K(int64(binary.BigEndian.Uint64(buf)))
+		}
+	}
+	var t time.Time
+	if err := sc.fallMap.Scan(m.oid, m.format, buf, &t); err != nil {
+		return time.Time{}, fmt.Errorf("time OID %d: %w (use legacy Source)", m.oid, err)
+	}
+	return t, nil
+}
+
+// microsecFromUnixEpochToY2K and the infinity sentinels mirror
+// pgtype/timestamptz.go so the conversion below stays exact.
+const microsecFromUnixEpochToY2K = 946_684_800 * 1_000_000
+
+const (
+	negInfinityMicros = -9223372036854775808
+	posInfinityMicros = 9223372036854775807
+)
+
+func decodeMicrosY2K(micros int64) (time.Time, error) {
+	switch micros {
+	case negInfinityMicros, posInfinityMicros:
+		return time.Time{}, fmt.Errorf("timestamp: infinity unsupported in vector Time")
+	}
+	// Identical arithmetic to pgx's binary timestamptz scan plan
+	// (including the zero remainder term) so vector and legacy times
+	// agree exactly, including pre-1970 negatives where Go division
+	// truncates toward zero on both sides.
+	sec := microsecFromUnixEpochToY2K/1_000_000 + micros/1_000_000
+	nsec := (microsecFromUnixEpochToY2K%1_000_000)*1_000 + (micros%1_000_000)*1_000
+	return time.Unix(sec, nsec), nil
+}
+
+// decodeNumeric keeps the text form: text numeric is copied, binary
+// numeric coerced via pgtype.
+func (sc *vscanner) decodeNumeric(buf []byte, m *colMeta) (string, error) {
+	if m.format == pgtype.TextFormatCode {
+		return string(buf), nil
+	}
+	var t pgtype.Text
+	if err := sc.fallMap.Scan(m.oid, m.format, buf, &t); err != nil {
+		return "", fmt.Errorf("numeric: %w (use legacy Source)", err)
+	}
+	if !t.Valid {
+		return "", fmt.Errorf("numeric: unexpected NULL decode")
+	}
+	return t.String, nil
+}

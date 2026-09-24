@@ -188,3 +188,193 @@ func (s *closeErrScanner) Next() bool {
 	}
 	s.cur = s.src.chunks[s.pos]
 	s.pos++
+	return true
+}
+func (s *closeErrScanner) Chunk() engine.Chunk { return s.cur }
+func (s *closeErrScanner) Err() error          { return s.err }
+func (s *closeErrScanner) Close() error        { return s.src.closeErr }
+
+func TestSchedulerCloseError(t *testing.T) {
+	// The reader's close-error send used to race the reassembler's
+	// close(errCh) (send on closed channel under -race). Both paths below
+	// must surface the close error deterministically with no sleeps: the
+	// straight path has a single channel owner, and the worker path orders
+	// every send before the close via readerDone.
+	closeErr := errors.New("close boom")
+	cases := []struct {
+		name string
+		ops  []engine.Operator
+	}{
+		{"straight", nil},
+		{"workers", []engine.Operator{&funcOp{fn: func(c engine.Chunk) (engine.Chunk, error) {
+			return c, nil
+		}}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src := &closeErrSource{
+				schema:   testSchema,
+				chunks:   []engine.Chunk{makeChunk(1)},
+				errAfter: -1,
+				closeErr: closeErr,
+			}
+			sched := engine.Scheduler{Workers: 2, QueueSize: 4}
+			chunks, errCh, err := sched.Run(context.Background(), src, tc.ops)
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			it := engine.NewIterator(chunks, errCh, nil)
+			_, err = drain(t, it)
+			if !errors.Is(err, closeErr) {
+				t.Fatalf("terminal = %v, want wrapped close error", err)
+			}
+		})
+	}
+}
+
+func TestSchedulerScanAndCloseError(t *testing.T) {
+	// Scan error is sent before close error on one bounded channel, so the
+	// scan error deterministically wins and the run terminates. Covers both
+	// the straight and worker paths.
+	cases := []struct {
+		name string
+		ops  []engine.Operator
+	}{
+		{"straight", nil},
+		{"workers", []engine.Operator{&funcOp{fn: func(c engine.Chunk) (engine.Chunk, error) {
+			return c, nil
+		}}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src := &closeErrSource{
+				schema:   testSchema,
+				chunks:   []engine.Chunk{makeChunk(1)},
+				errAfter: 1,
+				closeErr: errors.New("close after scan boom"),
+			}
+			sched := engine.Scheduler{Workers: 2, QueueSize: 4}
+			ctx := context.Background()
+			chunks, errCh, err := sched.Run(ctx, src, tc.ops)
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			it := engine.NewIterator(chunks, errCh, nil)
+			done := make(chan error, 1)
+			go func() {
+				var term error
+				for {
+					_, ok, err := it.Next(ctx)
+					if err != nil {
+						term = err
+						break
+					}
+					if !ok {
+						break
+					}
+				}
+				done <- term
+			}()
+			select {
+			case term := <-done:
+				if !errors.Is(term, errFakeScanBoom) {
+					t.Fatalf("terminal = %v, want wrapped scan error", term)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("run with scan+close errors did not terminate")
+			}
+		})
+	}
+}
+
+func TestSchedulerCloseErrorStress(t *testing.T) {
+	// Repeated close-error runs interleave reader sends with reassembler
+	// teardown; under -race any send-on-close or unsynchronized access
+	// fails. Tiny queue forces jobs-send blocking for varied interleavings.
+	for i := 0; i < 25; i++ {
+		closeErr := errors.New("close boom")
+		src := &closeErrSource{
+			schema:   testSchema,
+			chunks:   []engine.Chunk{makeChunk(i), makeChunk(i + 1)},
+			errAfter: -1,
+			closeErr: closeErr,
+		}
+		sched := engine.Scheduler{Workers: 2, QueueSize: 1}
+		identity := []engine.Operator{&funcOp{fn: func(c engine.Chunk) (engine.Chunk, error) {
+			return c, nil
+		}}}
+		chunks, errCh, err := sched.Run(context.Background(), src, identity)
+		if err != nil {
+			t.Fatalf("iter %d Run: %v", i, err)
+		}
+		it := engine.NewIterator(chunks, errCh, nil)
+		_, err = drain(t, it)
+		if !errors.Is(err, closeErr) {
+			t.Fatalf("iter %d terminal = %v, want wrapped close error", i, err)
+		}
+	}
+}
+
+func TestSchedulerWorkerAndScanError(t *testing.T) {
+	// Op error plus scan error: both the reader and the reassembler try
+	// to publish to errCh (capacity 1), so one of the `default` branches
+	// is exercised. The run must still surface an error promptly.
+	src := &closeErrSource{
+		schema:   testSchema,
+		chunks:   []engine.Chunk{makeChunk(1), makeChunk(2)},
+		errAfter: 1,
+		closeErr: nil,
+	}
+	wantErr := errors.New("worker boom")
+	bad := &funcOp{fn: func(c engine.Chunk) (engine.Chunk, error) {
+		time.Sleep(200 * time.Millisecond)
+		return engine.Chunk{}, wantErr
+	}}
+	sched := engine.Scheduler{Workers: 2, QueueSize: 4}
+	ctx := context.Background()
+	chunks, errCh, err := sched.Run(ctx, src, []engine.Operator{bad})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	it := engine.NewIterator(chunks, errCh, nil)
+	done := make(chan error, 1)
+	go func() {
+		var term error
+		for {
+			_, ok, err := it.Next(ctx)
+			if err != nil {
+				term = err
+				break
+			}
+			if !ok {
+				break
+			}
+		}
+		done <- term
+	}()
+	select {
+	case term := <-done:
+		if term == nil {
+			t.Fatal("want worker or scan error, got clean EOF")
+		}
+		// Either error is acceptable; both paths wrap with context.
+		if !errors.Is(term, wantErr) && term.Error() == "" {
+			t.Fatalf("unexpected terminal error: %v", term)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("run with worker+scan errors did not terminate")
+	}
+}
+
+func TestSchedulerNoDrainCancelCloses(t *testing.T) {
+	// Never draining `out` while cancelling forces the reassembler's
+	// emit path to observe ctx.Done instead of blocking forever.
+	var chunks []engine.Chunk
+	for i := 0; i < 32; i++ {
+		chunks = append(chunks, makeChunk(i))
+	}
+	src := &fakeSource{schema: testSchema, chunks: chunks, errAfter: -1}
+	sched := engine.Scheduler{Workers: 2, QueueSize: 1}
+	ctx, cancel := context.WithCancel(context.Background())
+	out, errCh, err := sched.Run(ctx, src, nil)
+	if err != nil {

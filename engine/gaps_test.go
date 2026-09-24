@@ -378,3 +378,189 @@ func TestSchedulerNoDrainCancelCloses(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	out, errCh, err := sched.Run(ctx, src, nil)
 	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	cancel()
+	timeout := time.After(5 * time.Second)
+	outClosed := false
+	errClosed := false
+	for !(outClosed && errClosed) {
+		select {
+		case _, ok := <-out:
+			if !ok {
+				outClosed = true
+			}
+		case _, ok := <-errCh:
+			if !ok {
+				errClosed = true
+			}
+		case <-timeout:
+			t.Fatalf("channels not closed after cancel without drain (out=%v err=%v): goroutine leak", outClosed, errClosed)
+		}
+	}
+}
+
+func TestSchedulerZeroDefaultsRun(t *testing.T) {
+	// Zero Workers/QueueSize must fall back to defaults and still run.
+	src := &fakeSource{schema: testSchema, chunks: []engine.Chunk{makeChunk(1, 2)}, errAfter: -1}
+	sched := engine.Scheduler{}
+	ctx := context.Background()
+	chunks, errCh, err := sched.Run(ctx, src, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	it := engine.NewIterator(chunks, errCh, nil)
+	got, err := drain(t, it)
+	if err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if len(got) != 1 || got[0].NumRows() != 2 {
+		t.Fatalf("unexpected output with defaults: %+v", got)
+	}
+}
+
+func TestSchedulerJobsSendCancel(t *testing.T) {
+	// Tiny queue plus a slow op forces the reader's `jobs <- j` send to
+	// block; cancelling must unblock the reader without leaking.
+	var chunks []engine.Chunk
+	for i := 0; i < 32; i++ {
+		chunks = append(chunks, makeChunk(i))
+	}
+	src := &fakeSource{schema: testSchema, chunks: chunks, errAfter: -1}
+	slow := &funcOp{fn: func(c engine.Chunk) (engine.Chunk, error) {
+		time.Sleep(100 * time.Millisecond)
+		return c, nil
+	}}
+	sched := engine.Scheduler{Workers: 1, QueueSize: 1}
+	ctx, cancel := context.WithCancel(context.Background())
+	out, errCh, err := sched.Run(ctx, src, []engine.Operator{slow})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	timeout := time.After(5 * time.Second)
+	for {
+		select {
+		case _, ok := <-out:
+			if !ok {
+				select {
+				case <-errCh:
+				case <-timeout:
+					t.Fatal("errCh not closed after jobs-send cancel")
+				}
+				return
+			}
+		case <-timeout:
+			t.Fatal("run did not terminate after jobs-send cancel")
+		}
+	}
+}
+
+func TestFilterKeepNoneAndAll(t *testing.T) {
+	none := engine.NewFilterOp(func([]any) (bool, error) { return false, nil })
+	got, err := none.Process(makeChunk(1, 2, 3))
+	if err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if got.NumRows() != 0 {
+		t.Fatalf("keep-none rows = %d, want 0", got.NumRows())
+	}
+	if len(got.Schema.Fields) != len(testSchema.Fields) {
+		t.Fatal("keep-none must preserve schema")
+	}
+	if err := got.Validate(); err != nil {
+		t.Fatalf("keep-none chunk invalid: %v", err)
+	}
+
+	all := engine.NewFilterOp(func([]any) (bool, error) { return true, nil })
+	got, err = all.Process(makeChunk(1, 2))
+	if err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if ids := col0(got); len(ids) != 2 || ids[0] != 1 || ids[1] != 2 {
+		t.Fatalf("keep-all rows = %v, want [1 2]", ids)
+	}
+}
+
+func TestFilterRowValues(t *testing.T) {
+	// The predicate must observe the correct per-row cells.
+	var seen [][]any
+	op := engine.NewFilterOp(func(row []any) (bool, error) {
+		cp := append([]any(nil), row...)
+		seen = append(seen, cp)
+		return true, nil
+	})
+	if _, err := op.Process(makeChunk(5, 6)); err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if len(seen) != 2 {
+		t.Fatalf("predicate calls = %d, want 2", len(seen))
+	}
+	if seen[0][0].(int64) != 5 || seen[0][1].(string) != "n5" {
+		t.Fatalf("row 0 = %v, want [5 n5]", seen[0])
+	}
+	if seen[1][0].(int64) != 6 || seen[1][1].(string) != "n6" {
+		t.Fatalf("row 1 = %v, want [6 n6]", seen[1])
+	}
+}
+
+func TestProjectDuplicatesAndEdges(t *testing.T) {
+	// Duplicates are allowed and preserve order.
+	dup, err := engine.NewProjectOp(1, 1, 0).Process(makeChunk(7))
+	if err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if len(dup.Schema.Fields) != 3 {
+		t.Fatalf("dup fields = %d, want 3", len(dup.Schema.Fields))
+	}
+	if dup.Schema.Fields[0].Name != "name" || dup.Schema.Fields[2].Name != "id" {
+		t.Fatalf("dup schema = %+v", dup.Schema.Fields)
+	}
+	if dup.Columns[0][0].(string) != "n7" || dup.Columns[1][0].(string) != "n7" {
+		t.Fatal("duplicate columns must share values")
+	}
+
+	// Negative and out-of-range indices fail.
+	for _, idx := range [][]int{{-1}, {2}, {0, 99}} {
+		if _, err := engine.NewProjectOp(idx...).Process(makeChunk(1)); err == nil {
+			t.Fatalf("project %v must fail", idx)
+		}
+	}
+
+	// Projecting an empty (0-row) chunk keeps schema, still valid.
+	empty := mustChunk(testSchema, [][]any{{}, {}})
+	got, err := engine.NewProjectOp(0).Process(empty)
+	if err != nil {
+		t.Fatalf("Process empty: %v", err)
+	}
+	if got.NumRows() != 0 || len(got.Schema.Fields) != 1 {
+		t.Fatalf("empty project = rows %d fields %d, want 0/1", got.NumRows(), len(got.Schema.Fields))
+	}
+	if err := got.Validate(); err != nil {
+		t.Fatalf("empty project invalid: %v", err)
+	}
+}
+
+func TestSchedulerOrderedMergeSingleWorker(t *testing.T) {
+	// Single worker preserves order trivially; guards against
+	// order assumptions that only hold with concurrency.
+	src := &fakeSource{schema: testSchema, chunks: []engine.Chunk{makeChunk(1), makeChunk(2)}, errAfter: -1}
+	sched := engine.Scheduler{Workers: 1, QueueSize: 1}
+	ctx := context.Background()
+	chunks, errCh, err := sched.Run(ctx, src, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	it := engine.NewIterator(chunks, errCh, nil)
+	got, err := drain(t, it)
+	if err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d chunks, want 2", len(got))
+	}
+	if got[0].Columns[0][0].(int64) != 1 || got[1].Columns[0][0].(int64) != 2 {
+		t.Fatal("single-worker order broken")
+	}
+}

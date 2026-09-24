@@ -93,3 +93,95 @@ type plainSource struct {
 }
 
 func (p *plainSource) Open(context.Context) (engine.Scanner, error) {
+	return &plainScanner{chunks: p.chunks}, nil
+}
+
+type plainScanner struct {
+	chunks []engine.Chunk
+	pos    int
+}
+
+func (s *plainScanner) Schema() engine.Schema { return testSchema }
+func (s *plainScanner) Next() bool {
+	if s.pos >= len(s.chunks) {
+		return false
+	}
+	s.pos++
+	return true
+}
+func (s *plainScanner) Chunk() engine.Chunk { return s.chunks[s.pos-1] }
+func (s *plainScanner) Err() error          { return nil }
+func (s *plainScanner) Close() error        { return nil }
+
+func TestExecuteWithoutChunkSizer(t *testing.T) {
+	src := &plainSource{chunks: []engine.Chunk{mustChunk(1, 2, 3)}}
+	it, err := qpx.Execute(context.Background(), src, qpx.ExecuteOptions{})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	defer func() { _ = it.Close() }()
+	total := 0
+	ctx := context.Background()
+	for {
+		c, ok, err := it.Next(ctx)
+		if err != nil {
+			t.Fatalf("Next: %v", err)
+		}
+		if !ok {
+			break
+		}
+		total += c.NumRows()
+	}
+	if total != 3 {
+		t.Fatalf("total = %d, want 3", total)
+	}
+}
+
+func TestExecuteNilOpsStreamsStraight(t *testing.T) {
+	src := &fakeSource{chunks: []engine.Chunk{mustChunk(4, 5)}}
+	opts := qpx.DefaultExecuteOptions()
+	opts.Ops = nil
+	it, err := qpx.Execute(context.Background(), src, opts)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	defer func() { _ = it.Close() }()
+	c, ok, err := it.Next(context.Background())
+	if err != nil || !ok {
+		t.Fatalf("Next = (ok=%v, err=%v), want chunk", ok, err)
+	}
+	if len(c.Schema.Fields) != 2 || c.NumRows() != 2 {
+		t.Fatalf("straight stream altered chunk: fields=%d rows=%d", len(c.Schema.Fields), c.NumRows())
+	}
+}
+
+func TestExecuteOpenError(t *testing.T) {
+	wantErr := errors.New("cannot open source")
+	src := &errSource{err: wantErr}
+	_, err := qpx.Execute(context.Background(), src, qpx.DefaultExecuteOptions())
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("Execute err = %v, want wrapped open error", err)
+	}
+}
+
+type errSource struct{ err error }
+
+func (e *errSource) Open(context.Context) (engine.Scanner, error) { return nil, e.err }
+
+func TestExecuteCloseTerminates(t *testing.T) {
+	src := &fakeSource{chunks: []engine.Chunk{mustChunk(1)}}
+	it, err := qpx.Execute(context.Background(), src, qpx.DefaultExecuteOptions())
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if err := it.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, ok, _ := it.Next(context.Background()); ok {
+		t.Fatal("Next after Close should report done")
+	}
+	// Second close stays idempotent through the Execute path.
+	if err := it.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+}

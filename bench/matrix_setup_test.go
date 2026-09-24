@@ -108,3 +108,111 @@ func mxBuild(ctx context.Context) error {
 	}
 	// qpx_bench_data.id is unique by construction (1..1M) but
 	// unconstrained, so add the UNIQUE once to give J a real FK target.
+	if err := mxEnsureUnique(ctx, conn); err != nil {
+		return err
+	}
+	return mxBuildJoin(ctx, conn)
+}
+
+// mxRebuild no-ops when tbl already holds want rows; otherwise it drops,
+// recreates (UNLOGGED), and refills deterministically via generate_series.
+func mxRebuild(ctx context.Context, conn *pgx.Conn, tbl string, want int64, ddl, ins string) error {
+	var n int64
+	if err := conn.QueryRow(ctx, "SELECT count(*) FROM "+tbl).Scan(&n); err == nil && n == want {
+		return nil
+	}
+	if _, err := conn.Exec(ctx, "DROP TABLE IF EXISTS "+tbl); err != nil {
+		return fmt.Errorf("drop %s: %w", tbl, err)
+	}
+	if _, err := conn.Exec(ctx, ddl); err != nil {
+		return fmt.Errorf("create %s: %w", tbl, err)
+	}
+	if _, err := conn.Exec(ctx, ins); err != nil {
+		return fmt.Errorf("fill %s: %w", tbl, err)
+	}
+	return nil
+}
+
+func mxEnsureUnique(ctx context.Context, conn *pgx.Conn) error {
+	var exists bool
+	if err := conn.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pg_constraint WHERE conname='qpx_bench_data_id_uniq')`).Scan(&exists); err != nil {
+		return fmt.Errorf("constraint check: %w", err)
+	}
+	if exists {
+		return nil
+	}
+	if _, err := conn.Exec(ctx,
+		`ALTER TABLE qpx_bench_data ADD CONSTRAINT qpx_bench_data_id_uniq UNIQUE (id)`); err != nil {
+		return fmt.Errorf("add unique: %w", err)
+	}
+	return nil
+}
+
+// mxBuildJoin builds the 1M probe side: jid matches M ids 1..1M exactly,
+// so the M⋈J equijoin yields 1M rows. Index on jid keeps nested-loop plans
+// honest; the FK documents the relationship into M.
+func mxBuildJoin(ctx context.Context, conn *pgx.Conn) error {
+	var n int64
+	if err := conn.QueryRow(ctx, "SELECT count(*) FROM "+mxTableJ).Scan(&n); err == nil && n == mxRowsJ {
+		_, err := conn.Exec(ctx, `CREATE INDEX IF NOT EXISTS qpx_bench_j_jid_idx ON `+mxTableJ+`(jid)`)
+		return err
+	}
+	if _, err := conn.Exec(ctx, "DROP TABLE IF EXISTS "+mxTableJ); err != nil {
+		return fmt.Errorf("drop %s: %w", mxTableJ, err)
+	}
+	ddl := `CREATE UNLOGGED TABLE ` + mxTableJ + `(jid bigint NOT NULL, payload double precision NOT NULL,` +
+		` CONSTRAINT qpx_bench_j_jid_fkey FOREIGN KEY (jid) REFERENCES qpx_bench_data(id))`
+	if _, err := conn.Exec(ctx, ddl); err != nil {
+		return fmt.Errorf("create %s: %w", mxTableJ, err)
+	}
+	ins := `INSERT INTO ` + mxTableJ +
+		` SELECT g, (g%1000)::float8/1000.0 FROM generate_series(1,1000000) g`
+	if _, err := conn.Exec(ctx, ins); err != nil {
+		return fmt.Errorf("fill %s: %w", mxTableJ, err)
+	}
+	if _, err := conn.Exec(ctx, `CREATE INDEX qpx_bench_j_jid_idx ON `+mxTableJ+`(jid)`); err != nil {
+		return fmt.Errorf("index %s: %w", mxTableJ, err)
+	}
+	return nil
+}
+
+// TestMxDatasetSanity guards matrix preconditions: exact row counts,
+// filter selectivity, group cardinalities, join size, and LIMIT size.
+// (M count/selectivity/glow are covered by TestDatasetSanity.)
+func TestMxDatasetSanity(t *testing.T) {
+	ensureMatrixDataset(t)
+	ctx := context.Background()
+	conn, err := openDB(ctx, resolveDSN())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	checks := []struct {
+		name string
+		sql  string
+		want int64
+	}{
+		{"s.rows", "SELECT count(*) FROM " + mxTableS, mxRowsS},
+		{"s.filter", "SELECT count(*) FROM " + mxTableS + " WHERE f > 0.5", 49999},
+		{"s.glow", "SELECT count(*) FROM (" + mxGlowS + ") s", 128},
+		{"s.ghigh", "SELECT count(*) FROM (" + mxGHighS + ") s", 100000},
+		{"l.rows", "SELECT count(*) FROM " + mxTableL, mxRowsL},
+		{"l.filter", "SELECT count(*) FROM " + mxTableL + " WHERE f > 0.5", 4999900},
+		{"l.glow", "SELECT count(*) FROM (" + mxGlowL + ") s", 128},
+		{"l.ghigh", "SELECT count(*) FROM (" + mxGHighL + ") s", 100000},
+		{"j.rows", "SELECT count(*) FROM " + mxTableJ, mxRowsJ},
+		{"m.join", "SELECT count(*) FROM qpx_bench_data d JOIN " + mxTableJ + " j ON j.jid = d.id", 1000000},
+		{"m.limit", "SELECT count(*) FROM (" + mxLimitQM + ") s", 100},
+		{"m.agg", "SELECT count(*) FROM (" + mxAggQM + ") s", 1},
+	}
+	for _, c := range checks {
+		var got int64
+		if err := conn.QueryRow(ctx, c.sql).Scan(&got); err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		if got != c.want {
+			t.Fatalf("%s: got %d, want %d", c.name, got, c.want)
+		}
+	}
+}

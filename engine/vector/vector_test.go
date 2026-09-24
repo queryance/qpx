@@ -218,3 +218,227 @@ func TestFilterTypeMismatch(t *testing.T) {
 
 func TestProject(t *testing.T) {
 	b := testBatch()
+	got, err := vector.NewProject(3, 0).Process(b)
+	if err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if len(got.Schema.Fields) != 2 || got.Schema.Fields[0].Name != "ts" {
+		t.Fatalf("unexpected schema: %+v", got.Schema.Fields)
+	}
+	if got.Columns[1].Ints[0] != 1 {
+		t.Fatal("projected column data mismatch (must alias input)")
+	}
+	if _, err := vector.NewProject().Process(testBatch()); err == nil {
+		t.Fatal("empty projection must fail")
+	}
+	if _, err := vector.NewProject(7).Process(testBatch()); err == nil {
+		t.Fatal("out-of-range projection must fail")
+	}
+	// Selection survives projection.
+	filt, _ := vector.NewInt64Filter(0, vector.Gt, 4).Process(testBatch())
+	pgot, err := vector.NewProject(0).Process(filt)
+	if err != nil {
+		t.Fatalf("project after filter: %v", err)
+	}
+	if ids := selectedInts(pgot); len(ids) != 2 || ids[0] != 5 {
+		t.Fatalf("unexpected survivors: %v", ids)
+	}
+}
+
+func TestFusedEqualsSequential(t *testing.T) {
+	runSeq := func() []int64 {
+		b := testBatch()
+		f, err := vector.NewFloat64Filter(1, vector.Gt, 0.25).Process(b)
+		if err != nil {
+			t.Fatalf("seq filter: %v", err)
+		}
+		p, err := vector.NewProject(0, 1).Process(f)
+		if err != nil {
+			t.Fatalf("seq project: %v", err)
+		}
+		return selectedInts(p)
+	}
+	b := testBatch()
+	fused, err := vector.NewFilterFloat64GTProject(1, 0.25, 0, 1).Process(b)
+	if err != nil {
+		t.Fatalf("fused: %v", err)
+	}
+	seq, fus := runSeq(), selectedInts(fused)
+	if len(seq) != len(fus) {
+		t.Fatalf("seq=%v fused=%v", seq, fus)
+	}
+	for i := range seq {
+		if seq[i] != fus[i] {
+			t.Fatalf("seq=%v fused=%v", seq, fus)
+		}
+	}
+	if len(fused.Schema.Fields) != 2 {
+		t.Fatalf("fused schema fields = %d, want 2", len(fused.Schema.Fields))
+	}
+	if _, err := (&vector.FilterProject{Indices: []int{0}}).Process(testBatch()); err == nil {
+		t.Fatal("fused with nil filter must fail")
+	}
+}
+
+func TestChunkRoundTrip(t *testing.T) {
+	b := testBatch()
+	// NULL in every type.
+	b.Columns[0].Ints[1] = 0
+	b.Columns[0].Nulls = make([]bool, 6)
+	b.Columns[0].Nulls[1] = true
+	b.Columns[0].HasNulls = true
+	c, err := b.ToChunk()
+	if err != nil {
+		t.Fatalf("ToChunk: %v", err)
+	}
+	if c.NumRows() != 6 {
+		t.Fatalf("chunk rows = %d, want 6", c.NumRows())
+	}
+	if c.Columns[0][1] != nil {
+		t.Fatalf("NULL did not survive ToChunk: %v", c.Columns[0][1])
+	}
+	back, err := vector.FromChunk(c)
+	if err != nil {
+		t.Fatalf("FromChunk: %v", err)
+	}
+	if err := back.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if !back.Columns[0].IsNull(1) {
+		t.Fatal("NULL did not survive round trip")
+	}
+	if back.Columns[0].Ints[0] != 1 || back.Columns[1].Floats[5] != 0.6 ||
+		back.Columns[2].Strings[0] != "b" || !back.Columns[3].Times[0].Equal(time.Unix(1, 0)) {
+		t.Fatal("values did not survive round trip")
+	}
+	// Selection honored.
+	filt, _ := vector.NewInt64Filter(0, vector.Gt, 4).Process(testBatch())
+	fc, err := filt.ToChunk()
+	if err != nil {
+		t.Fatalf("ToChunk selected: %v", err)
+	}
+	if fc.NumRows() != 2 || fc.Columns[0][0].(int64) != 5 {
+		t.Fatalf("selected chunk wrong: %v", fc.Columns[0])
+	}
+}
+
+func TestFromChunkRejects(t *testing.T) {
+	schema := engine.Schema{Fields: []engine.Field{{Name: "id", Type: engine.Int64}}}
+	c, err := engine.NewChunk(schema, [][]any{{"not-an-int"}})
+	if err != nil {
+		t.Fatalf("NewChunk: %v", err)
+	}
+	if _, err := vector.FromChunk(c); err == nil {
+		t.Fatal("mistyped cell must fail, not coerce")
+	}
+	bad := engine.Chunk{Schema: schema, Columns: [][]any{{int64(1)}, {"x"}}}
+	if _, err := vector.FromChunk(bad); err == nil {
+		t.Fatal("ragged chunk must fail")
+	}
+}
+
+func TestSchedulerStraightAndOps(t *testing.T) {
+	src := &fakeBatchSource{schema: testSchema, batches: []*vector.Batch{testBatch(), testBatch()}}
+	sched := vector.Scheduler{Workers: 2, QueueSize: 4}
+	ctx := context.Background()
+	chunks, errCh, err := sched.Run(ctx, src, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	it := vector.NewIterator(chunks, errCh, nil)
+	total := 0
+	for {
+		b, ok, err := it.Next(ctx)
+		if err != nil {
+			t.Fatalf("Next: %v", err)
+		}
+		if !ok {
+			break
+		}
+		total += b.Len()
+	}
+	if total != 12 {
+		t.Fatalf("total = %d, want 12", total)
+	}
+
+	// Ops path: filter + project, order preserved across batches.
+	src2 := &fakeBatchSource{schema: testSchema, batches: []*vector.Batch{testBatch(), testBatch()}}
+	chunks2, errCh2, err := sched.Run(ctx, src2, []vector.Operator{
+		vector.NewInt64Filter(0, vector.Gt, 4),
+		vector.NewProject(0),
+	})
+	if err != nil {
+		t.Fatalf("Run ops: %v", err)
+	}
+	it2 := vector.NewIterator(chunks2, errCh2, nil)
+	var ids []int64
+	for {
+		b, ok, err := it2.Next(ctx)
+		if err != nil {
+			t.Fatalf("Next ops: %v", err)
+		}
+		if !ok {
+			break
+		}
+		if len(b.Schema.Fields) != 1 {
+			t.Fatalf("projected fields = %d, want 1", len(b.Schema.Fields))
+		}
+		ids = append(ids, selectedInts(b)...)
+	}
+	if len(ids) != 4 || ids[0] != 5 || ids[1] != 6 || ids[2] != 5 || ids[3] != 6 {
+		t.Fatalf("ordered survivors wrong: %v", ids)
+	}
+}
+
+func TestSchedulerOpError(t *testing.T) {
+	src := &fakeBatchSource{schema: testSchema, batches: []*vector.Batch{testBatch()}}
+	sched := vector.Scheduler{}
+	wantErr := errors.New("boom")
+	chunks, errCh, err := sched.Run(context.Background(), src, []vector.Operator{&failOp{err: wantErr}})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	it := vector.NewIterator(chunks, errCh, nil)
+	for {
+		_, ok, err := it.Next(context.Background())
+		if err != nil {
+			if !errors.Is(err, wantErr) {
+				t.Fatalf("want wrapped op error, got %v", err)
+			}
+			return
+		}
+		if !ok {
+			t.Fatal("want op error, got clean EOF")
+		}
+	}
+}
+
+type failOp struct{ err error }
+
+func (o *failOp) Process(b *vector.Batch) (*vector.Batch, error) { return nil, o.err }
+
+type fakeBatchSource struct {
+	schema  engine.Schema
+	batches []*vector.Batch
+}
+
+func (f *fakeBatchSource) OpenBatch(ctx context.Context) (vector.Scanner, error) {
+	return &fakeBatchScanner{src: f}, nil
+}
+
+type fakeBatchScanner struct {
+	src *fakeBatchSource
+	pos int
+}
+
+func (s *fakeBatchScanner) Schema() engine.Schema { return s.src.schema }
+func (s *fakeBatchScanner) Next() bool {
+	if s.pos >= len(s.src.batches) {
+		return false
+	}
+	s.pos++
+	return true
+}
+func (s *fakeBatchScanner) Batch() *vector.Batch { return s.src.batches[s.pos-1] }
+func (s *fakeBatchScanner) Err() error           { return nil }
+func (s *fakeBatchScanner) Close() error         { return nil }

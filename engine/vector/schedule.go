@@ -168,3 +168,176 @@ func (s Scheduler) Run(ctx context.Context, src Source, ops []Operator) (<-chan 
 
 func runStraight(parent, runCtx context.Context, cancel context.CancelFunc, scanner Scanner, out chan<- *Batch, errCh chan<- error) {
 	defer func() {
+		if cerr := scanner.Close(); cerr != nil {
+			select {
+			case errCh <- fmt.Errorf("vector: scheduler: close source: %w", cerr):
+			default:
+			}
+		}
+		if parent.Err() != nil {
+			select {
+			case errCh <- fmt.Errorf("vector: scheduler: %w", parent.Err()):
+			default:
+			}
+		}
+		cancel()
+		close(out)
+		close(errCh)
+	}()
+	for scanner.Next() {
+		select {
+		case <-runCtx.Done():
+			return
+		case out <- scanner.Batch():
+		}
+	}
+	if serr := scanner.Err(); serr != nil {
+		select {
+		case errCh <- fmt.Errorf("vector: scheduler: scan: %w", serr):
+		default:
+		}
+		cancel()
+	}
+}
+
+func runReader(ctx context.Context, cancel context.CancelFunc, scanner Scanner, jobs chan<- seqBatch, sendErr func(error), readerDone chan struct{}) {
+	defer close(readerDone)
+	defer func() {
+		close(jobs)
+		if cerr := scanner.Close(); cerr != nil {
+			sendErr(fmt.Errorf("vector: scheduler: close source: %w", cerr))
+		}
+	}()
+	seq := 0
+	for scanner.Next() {
+		j := seqBatch{seq: seq, batch: scanner.Batch()}
+		seq++
+		select {
+		case <-ctx.Done():
+			return
+		case jobs <- j:
+		}
+	}
+	if serr := scanner.Err(); serr != nil {
+		sendErr(fmt.Errorf("vector: scheduler: scan: %w", serr))
+		cancel()
+	}
+}
+
+func reassemble(parent, runCtx context.Context, cancel context.CancelFunc, results <-chan seqResult, out chan<- *Batch, sendErr func(error), closeErrCh func(), readerDone <-chan struct{}) {
+	defer func() {
+		cancel()
+		<-readerDone
+		if parent.Err() != nil {
+			sendErr(fmt.Errorf("vector: scheduler: %w", parent.Err()))
+		}
+		close(out)
+		closeErrCh()
+	}()
+	pending := make(map[int]*Batch)
+	next := 0
+	emit := func() {
+		for {
+			b, ok := pending[next]
+			if !ok {
+				return
+			}
+			delete(pending, next)
+			next++
+			select {
+			case <-runCtx.Done():
+				return
+			case out <- b:
+			}
+		}
+	}
+	for {
+		select {
+		case <-runCtx.Done():
+			return
+		case r, ok := <-results:
+			if !ok {
+				emit()
+				return
+			}
+			if r.err != nil {
+				sendErr(r.err)
+				return
+			}
+			pending[r.seq] = r.batch
+			emit()
+		}
+	}
+}
+
+// Iterator drains the ordered batch channel of a Scheduler run. Semantics
+// mirror engine.Iterator: after exhaustion Next keeps returning the
+// terminal error; Close is idempotent and never starves a blocked Next.
+type Iterator struct {
+	batches <-chan *Batch
+	errCh   <-chan error
+	cancel  context.CancelFunc
+
+	cancelOnce sync.Once
+	mu         sync.Mutex
+	done       bool
+	err        error
+}
+
+// NewIterator builds an Iterator over a Scheduler run.
+func NewIterator(batches <-chan *Batch, errCh <-chan error, cancel context.CancelFunc) *Iterator {
+	return &Iterator{batches: batches, errCh: errCh, cancel: cancel}
+}
+
+// Next returns the next batch. ok is false at end of stream, in which
+// case err carries the terminal error. The passed ctx bounds only this
+// call: cancelling it returns ctx.Err() without marking done.
+func (it *Iterator) Next(ctx context.Context) (b *Batch, ok bool, err error) {
+	it.mu.Lock()
+	if it.done {
+		term := it.err
+		it.mu.Unlock()
+		return nil, false, term
+	}
+	batches := it.batches
+	errCh := it.errCh
+	it.mu.Unlock()
+
+	select {
+	case <-ctx.Done():
+		return nil, false, ctx.Err()
+	case batch, open := <-batches:
+		if !open {
+			var term error
+			select {
+			case e, has := <-errCh:
+				if has {
+					term = e
+				}
+			default:
+			}
+			it.mu.Lock()
+			if !it.done {
+				it.done = true
+				it.err = term
+			}
+			term = it.err
+			it.mu.Unlock()
+			return nil, false, term
+		}
+		return batch, true, nil
+	}
+}
+
+// Close stops the underlying run. It never blocks on a concurrent Next.
+func (it *Iterator) Close() error {
+	it.cancelOnce.Do(func() {
+		if it.cancel != nil {
+			it.cancel()
+		}
+	})
+	it.mu.Lock()
+	it.done = true
+	it.mu.Unlock()
+	return nil
+}

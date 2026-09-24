@@ -318,3 +318,159 @@ func runVectorGroupBy128PG(ctx context.Context) (int64, error) {
 	defer func() { _ = it.Close() }()
 	g := vector.NewGroupByInt64(0, 1, 128)
 	for {
+		bh, ok, err := it.Next(ctx)
+		if err != nil {
+			return 0, err
+		}
+		if !ok {
+			return int64(g.Len()), nil
+		}
+		if err := g.Add(bh); err != nil {
+			return 0, err
+		}
+	}
+}
+
+func BenchmarkVectorGroupBy128PG(b *testing.B) {
+	drive(b, `SELECT id, f FROM qpx_bench_data`, func(ctx context.Context, _ string) (int64, error) {
+		return runVectorGroupBy128PG(ctx)
+	})
+}
+
+// TestVectorGroupBy128Live guards the engine-side group-by on the real
+// 1M-row dataset: per-group rows match PG's GROUP BY exactly, sums and
+// avgs within fold-order tolerance.
+func TestVectorGroupBy128Live(t *testing.T) {
+	ensureDataset(t)
+	if resolveDSN() == "" {
+		t.Fatalf("bench: no working DSN (tried %v)", dsnCandidates)
+	}
+	ctx := context.Background()
+	src := postgres.NewVectorSource(postgres.Config{ConnString: resolveDSN(), SQL: `SELECT id, f FROM qpx_bench_data`})
+	it, err := qpx.ExecuteVector(ctx, src, qpx.DefaultVectorOptions())
+	if err != nil {
+		t.Fatalf("ExecuteVector: %v", err)
+	}
+	defer func() { _ = it.Close() }()
+	g := vector.NewGroupByInt64(0, 1, 128)
+	for {
+		bh, ok, err := it.Next(ctx)
+		if err != nil {
+			t.Fatalf("Next: %v", err)
+		}
+		if !ok {
+			break
+		}
+		if err := g.Add(bh); err != nil {
+			t.Fatalf("Add: %v", err)
+		}
+	}
+	rows := g.SortedRows()
+	if len(rows) != 128 {
+		t.Fatalf("groups = %d, want 128", len(rows))
+	}
+	conn, err := openDB(ctx, resolveDSN())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	pgRows, err := conn.Query(ctx,
+		`SELECT (id % 128) AS k, count(*), sum(f), avg(f) FROM qpx_bench_data GROUP BY 1 ORDER BY 1`)
+	if err != nil {
+		t.Fatalf("pg group-by: %v", err)
+	}
+	defer pgRows.Close()
+	i := 0
+	for pgRows.Next() {
+		var k, n int64
+		var sv, av any
+		if err := pgRows.Scan(&k, &n, &sv, &av); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if i >= len(rows) {
+			t.Fatalf("pg has more groups than engine")
+		}
+		gr := rows[i]
+		i++
+		if gr.Key != k || gr.Rows != n || gr.Count != n {
+			t.Fatalf("group %d: rows/count = %d/%d, want key=%d rows=%d", i, gr.Key, gr.Rows, k, n)
+		}
+		sf, ok1 := sv.(float64)
+		if !ok1 {
+			t.Fatalf("group %d: sum is %T, want float64", k, sv)
+		}
+		d := gr.Sum - sf
+		if d < 0 {
+			d = -d
+		}
+		if d > 1e-6 {
+			t.Fatalf("group %d: sum = %v, want %v", k, gr.Sum, sf)
+		}
+		_ = av
+	}
+	if err := pgRows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	if i != 128 {
+		t.Fatalf("compared %d groups, want 128", i)
+	}
+}
+
+// TestVectorMemory compares allocator traffic for legacy scan, vector
+// scan, and vector scan+engine-agg on the M dataset. The signal is the
+// TotalAlloc delta around each drain: cumulative, so GC timing cannot
+// skew it (HeapAlloc snapshots are intentionally not used — sampling
+// HeapAlloc post-drain without a GC is noise). The vec+agg drain folds
+// into 128 groups, so its row count is 128, not benchRows: scan cost and
+// agg cost are reported separately instead of mixing them into one b/row.
+func TestVectorMemory(t *testing.T) {
+	ensureMatrixDataset(t)
+	ctx := context.Background()
+	drainLegacy := func() (int64, error) { return runQPX(ctx, sqlQ1) }
+	drainVector := func() (int64, error) { return runVectorWorkers(ctx, sqlQ1, 4, nil) }
+	drainVectorAgg := func() (int64, error) { return runVectorGroupBy128PG(ctx) }
+	systems := []struct {
+		name  string
+		want  int64
+		drain func() (int64, error)
+	}{
+		{"legacy", benchRows, drainLegacy},
+		{"vector", benchRows, drainVector},
+		{"vec+agg", 128, drainVectorAgg},
+	}
+	totals := make(map[string]uint64, len(systems))
+	t.Logf("%-7s %10s %12s %10s", "system", "rows", "total_alloc", "b/row")
+	for _, s := range systems {
+		runtime.GC()
+		var m0, m1 runtime.MemStats
+		runtime.ReadMemStats(&m0)
+		n, err := s.drain()
+		runtime.ReadMemStats(&m1)
+		if err != nil {
+			t.Fatalf("%s drain: %v", s.name, err)
+		}
+		if n != s.want {
+			t.Fatalf("%s drain: got %d rows, want %d", s.name, n, s.want)
+		}
+		total := m1.TotalAlloc - m0.TotalAlloc
+		if total == 0 {
+			t.Fatalf("%s drain: zero TotalAlloc delta, measurement broken", s.name)
+		}
+		totals[s.name] = total
+		t.Logf("%-7s %10d %12d %10d", s.name, n, total, total/uint64(n))
+	}
+	// Agg cost isolated from scan cost: the fold into 128 groups must cost
+	// far less than the 1M-row scan underneath it. Bound is deliberately
+	// loose (4x) — TotalAlloc is cumulative and stable, this only trips on
+	// order-of-magnitude regressions (e.g. retaining batches per group).
+	aggOverhead := int64(totals["vec+agg"]) - int64(totals["vector"])
+	if aggOverhead < 0 {
+		aggOverhead = 0
+	}
+	t.Logf("agg-overhead (vec+agg minus vector scan): %d bytes total, %d b/scan-row",
+		aggOverhead, uint64(aggOverhead)/uint64(benchRows))
+	if totals["vec+agg"] >= 4*totals["vector"] {
+		t.Fatalf("vec+agg TotalAlloc %d >= 4x vector scan %d: agg retains too much",
+			totals["vec+agg"], totals["vector"])
+	}
+}

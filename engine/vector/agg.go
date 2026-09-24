@@ -198,3 +198,213 @@ func (g *GroupByInt64) Add(b *Batch) error {
 	}
 	n := b.Len()
 	if n == 0 {
+		return nil
+	}
+	if g.groups == nil {
+		g.groups = make(map[int64]groupState)
+	}
+	keyOf := func(k int64) int64 {
+		if g.Mod != 0 {
+			return k % g.Mod
+		}
+		return k
+	}
+	if b.Sel == nil {
+		for r := 0; r < n; r++ {
+			if len(keyNulls) > 0 && keyNulls[r] {
+				g.hasNull = true
+				v, ok := measureAt(vals, valNulls, hasVal, r)
+				g.nullKey.add(v, ok)
+				continue
+			}
+			k := keyOf(keys[r])
+			st := g.groups[k]
+			v, ok := measureAt(vals, valNulls, hasVal, r)
+			st.add(v, ok)
+			g.groups[k] = st
+		}
+		return nil
+	}
+	for _, s := range b.Sel {
+		r := int(s)
+		if len(keyNulls) > 0 && keyNulls[r] {
+			g.hasNull = true
+			v, ok := measureAt(vals, valNulls, hasVal, r)
+			g.nullKey.add(v, ok)
+			continue
+		}
+		k := keyOf(keys[r])
+		st := g.groups[k]
+		v, ok := measureAt(vals, valNulls, hasVal, r)
+		st.add(v, ok)
+		g.groups[k] = st
+	}
+	return nil
+}
+
+// Merge folds other's groups into g, single-threaded after workers finish.
+func (g *GroupByInt64) Merge(other *GroupByInt64) {
+	if g.groups == nil {
+		g.groups = make(map[int64]groupState, len(other.groups))
+	}
+	for k, o := range other.groups {
+		st := g.groups[k]
+		st.merge(o)
+		g.groups[k] = st
+	}
+	if other.hasNull {
+		g.hasNull = true
+		g.nullKey.merge(other.nullKey)
+	}
+}
+
+// Reset clears all groups for reuse.
+func (g *GroupByInt64) Reset() {
+	for k := range g.groups {
+		delete(g.groups, k)
+	}
+	g.nullKey = groupState{}
+	g.hasNull = false
+}
+
+// Len reports the number of groups, including the NULL group when present.
+func (g *GroupByInt64) Len() int {
+	n := len(g.groups)
+	if g.hasNull {
+		n++
+	}
+	return n
+}
+
+// HasNullGroup reports whether any NULL key was seen.
+func (g *GroupByInt64) HasNullGroup() bool { return g.hasNull }
+
+// SortedRows returns groups ordered by key. The NULL group, when present,
+// sorts last; use NullGroup for an explicit handle instead.
+func (g *GroupByInt64) SortedRows() []Int64Group {
+	out := make([]Int64Group, 0, g.Len())
+	for k, st := range g.groups {
+		out = append(out, finishInt64Group(k, st))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	return out
+}
+
+// NullGroup returns the NULL-key group, or nil when no NULL key was seen.
+func (g *GroupByInt64) NullGroup() *Int64Group {
+	if !g.hasNull {
+		return nil
+	}
+	gr := finishInt64Group(0, g.nullKey)
+	return &gr
+}
+
+func finishInt64Group(k int64, st groupState) Int64Group {
+	g := Int64Group{Key: k, Rows: st.rows, Count: st.count, Sum: st.sum}
+	if st.count > 0 {
+		g.Avg = st.sum / float64(st.count)
+	}
+	return g
+}
+
+// StringGroup is one string-keyed group's finished row.
+type StringGroup struct {
+	Key   string
+	Rows  int64
+	Count int64
+	Sum   float64
+	Avg   float64
+}
+
+// GroupByString groups by a string column with a float measure. Keys are
+// hashed directly (map[string]): dictionary encoding would add a full
+// pre-pass plus an int64 group-by for the same result, which only pays
+// off at cardinalities far above the profiled shape (1K short keys — see
+// the string micro-bench). ValCol < 0 means count-only.
+type GroupByString struct {
+	KeyCol int
+	ValCol int
+
+	groups  map[string]groupState
+	nullKey groupState
+	hasNull bool
+}
+
+// NewGroupByString builds a string group-by. valCol < 0 selects count-only.
+func NewGroupByString(keyCol, valCol int) *GroupByString {
+	return &GroupByString{KeyCol: keyCol, ValCol: valCol, groups: make(map[string]groupState)}
+}
+
+// Add folds b into the group table, honoring its selection vector.
+func (g *GroupByString) Add(b *Batch) error {
+	if err := checkAggColumn(b, g.KeyCol, engine.String, "groupby-string"); err != nil {
+		return err
+	}
+	if g.ValCol >= 0 {
+		if err := checkAggColumn(b, g.ValCol, engine.Float64, "groupby-string"); err != nil {
+			return err
+		}
+	}
+	keys := b.Columns[g.KeyCol].Strings
+	keyNulls := b.Columns[g.KeyCol].Nulls
+	hasVal := g.ValCol >= 0
+	var vals []float64
+	var valNulls []bool
+	if hasVal {
+		vals = b.Columns[g.ValCol].Floats
+		valNulls = b.Columns[g.ValCol].Nulls
+	}
+	n := b.Len()
+	if n == 0 {
+		return nil
+	}
+	if g.groups == nil {
+		g.groups = make(map[string]groupState)
+	}
+	if b.Sel == nil {
+		for r := 0; r < n; r++ {
+			if len(keyNulls) > 0 && keyNulls[r] {
+				g.hasNull = true
+				v, ok := measureAt(vals, valNulls, hasVal, r)
+				g.nullKey.add(v, ok)
+				continue
+			}
+			st := g.groups[keys[r]]
+			v, ok := measureAt(vals, valNulls, hasVal, r)
+			st.add(v, ok)
+			g.groups[keys[r]] = st
+		}
+		return nil
+	}
+	for _, s := range b.Sel {
+		r := int(s)
+		if len(keyNulls) > 0 && keyNulls[r] {
+			g.hasNull = true
+			v, ok := measureAt(vals, valNulls, hasVal, r)
+			g.nullKey.add(v, ok)
+			continue
+		}
+		st := g.groups[keys[r]]
+		v, ok := measureAt(vals, valNulls, hasVal, r)
+		st.add(v, ok)
+		g.groups[keys[r]] = st
+	}
+	return nil
+}
+
+// Merge folds other's groups into g, single-threaded after workers finish.
+func (g *GroupByString) Merge(other *GroupByString) {
+	if g.groups == nil {
+		g.groups = make(map[string]groupState, len(other.groups))
+	}
+	for k, o := range other.groups {
+		st := g.groups[k]
+		st.merge(o)
+		g.groups[k] = st
+	}
+	if other.hasNull {
+		g.hasNull = true
+		g.nullKey.merge(other.nullKey)
+	}
+}
+

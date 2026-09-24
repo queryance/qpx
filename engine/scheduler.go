@@ -118,3 +118,114 @@ func (s Scheduler) Run(ctx context.Context, src Source, ops []Operator) (<-chan 
 	closeErrCh := func() {
 		errMu.Lock()
 		defer errMu.Unlock()
+		if !errClosed {
+			errClosed = true
+			close(errCh)
+		}
+	}
+	readerDone := make(chan struct{})
+
+	var wg sync.WaitGroup
+	for range nw {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-runCtx.Done():
+					return
+				case j, ok := <-jobs:
+					if !ok {
+						return
+					}
+					c, werr := applyOps(j.chunk, ops)
+					if werr != nil {
+						werr = fmt.Errorf("scheduler: worker: %w", werr)
+					}
+					select {
+					case <-runCtx.Done():
+						return
+					case results <- seqResult{seq: j.seq, chunk: c, err: werr}:
+					}
+				}
+			}
+		}()
+	}
+
+	go runReader(runCtx, cancel, scanner, jobs, sendErr, readerDone)
+
+	// Closer: no more results once workers drain.
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	go reassemble(ctx, runCtx, cancel, results, out, sendErr, closeErrCh, readerDone)
+
+	return out, errCh, nil
+}
+
+// runStraight streams scanner chunks directly to out in source order.
+// It owns both channels, so sends and closes need no synchronization.
+// parent reports external cancellation; runCtx drives teardown.
+func runStraight(parent, runCtx context.Context, cancel context.CancelFunc, scanner Scanner, out chan<- Chunk, errCh chan<- error) {
+	defer func() {
+		if cerr := scanner.Close(); cerr != nil {
+			select {
+			case errCh <- fmt.Errorf("scheduler: close source: %w", cerr):
+			default:
+			}
+		}
+		if parent.Err() != nil {
+			select {
+			case errCh <- fmt.Errorf("scheduler: %w", parent.Err()):
+			default:
+			}
+		}
+		cancel()
+		close(out)
+		close(errCh)
+	}()
+	for scanner.Next() {
+		select {
+		case <-runCtx.Done():
+			return
+		case out <- scanner.Chunk():
+		}
+	}
+	if serr := scanner.Err(); serr != nil {
+		select {
+		case errCh <- fmt.Errorf("scheduler: scan: %w", serr):
+		default:
+		}
+		cancel()
+	}
+}
+
+// runReader packs sequence numbers onto queued chunks. Teardown order:
+// close(jobs) first so a hung scanner.Close cannot wedge workers, then
+// close the scanner and report its error, then close readerDone so the
+// reassembler knows no more sends are coming.
+func runReader(ctx context.Context, cancel context.CancelFunc, scanner Scanner, jobs chan<- seqChunk, sendErr func(error), readerDone chan struct{}) {
+	defer close(readerDone)
+	defer func() {
+		close(jobs)
+		if cerr := scanner.Close(); cerr != nil {
+			sendErr(fmt.Errorf("scheduler: close source: %w", cerr))
+		}
+	}()
+	seq := 0
+	for scanner.Next() {
+		j := seqChunk{seq: seq, chunk: scanner.Chunk()}
+		seq++
+		select {
+		case <-ctx.Done():
+			return
+		case jobs <- j:
+		}
+	}
+	if serr := scanner.Err(); serr != nil {
+		sendErr(fmt.Errorf("scheduler: scan: %w", serr))
+		cancel()
+	}
+}

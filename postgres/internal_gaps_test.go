@@ -128,3 +128,130 @@ func TestInternalScannerNextChunks(t *testing.T) {
 	}, nil)
 	sc := &scanner{ctx: context.Background(), rows: rows, schema: internalTestSchema, size: 2}
 	if got := sc.Schema(); len(got.Fields) != 2 {
+		t.Fatalf("Schema fields = %d, want 2", len(got.Fields))
+	}
+	if !sc.Next() {
+		t.Fatal("first Next = false, want true")
+	}
+	if n := sc.Chunk().NumRows(); n != 2 {
+		t.Fatalf("first chunk rows = %d, want 2", n)
+	}
+	if err := sc.Chunk().Validate(); err != nil {
+		t.Fatalf("first chunk invalid: %v", err)
+	}
+	if got := sc.Chunk().Columns[0][0].(int64); got != 1 {
+		t.Fatalf("row 0 = %v, want 1", got)
+	}
+	if !sc.Next() {
+		t.Fatal("second Next = false, want true")
+	}
+	if n := sc.Chunk().NumRows(); n != 1 {
+		t.Fatalf("second chunk rows = %d, want 1", n)
+	}
+	if got := sc.Chunk().Columns[0][0].(int64); got != 3 {
+		t.Fatalf("row 0 of second chunk = %v, want 3", got)
+	}
+	if sc.Next() {
+		t.Fatal("third Next = true, want false (exhausted)")
+	}
+	if err := sc.Err(); err != nil {
+		t.Fatalf("Err = %v, want nil", err)
+	}
+	// Exhausted Next stays false.
+	if sc.Next() {
+		t.Fatal("Next after exhaustion must stay false")
+	}
+}
+
+func TestInternalScannerNextEmpty(t *testing.T) {
+	rows := newFakeRows(nil, nil)
+	sc := &scanner{ctx: context.Background(), rows: rows, schema: internalTestSchema, size: 2}
+	if sc.Next() {
+		t.Fatal("Next on empty rows = true, want false")
+	}
+	if err := sc.Err(); err != nil {
+		t.Fatalf("Err = %v, want nil", err)
+	}
+}
+
+func TestInternalScannerNextValuesError(t *testing.T) {
+	wantErr := errors.New("decode boom")
+	rows := newFakeRows([][]any{{int64(1), "a"}}, nil)
+	rows.valuesErr = wantErr
+	sc := &scanner{ctx: context.Background(), rows: rows, schema: internalTestSchema, size: 10}
+	if sc.Next() {
+		t.Fatal("Next with Values error = true, want false")
+	}
+	if !errors.Is(sc.Err(), wantErr) {
+		t.Fatalf("Err = %v, want wrapped decode boom", sc.Err())
+	}
+	// Scan error is sticky: further Next calls stay false.
+	if sc.Next() {
+		t.Fatal("Next after Values error must stay false")
+	}
+}
+
+func TestInternalScannerNextRowsErr(t *testing.T) {
+	wantErr := errors.New("rows boom")
+	rows := newFakeRows([][]any{{int64(1), "a"}}, nil)
+	rows.rowsErr = wantErr
+	sc := &scanner{ctx: context.Background(), rows: rows, schema: internalTestSchema, size: 10}
+	if sc.Next() {
+		t.Fatal("Next with rows.Err set = true, want false")
+	}
+	if !errors.Is(sc.Err(), wantErr) {
+		t.Fatalf("Err = %v, want wrapped rows boom", sc.Err())
+	}
+}
+
+func TestInternalScannerShortAndLongRows(t *testing.T) {
+	// Short rows nil-fill, long rows ignore extras (matches PackChunk).
+	rows := newFakeRows([][]any{
+		{int64(1)},
+		{int64(2), "b", "EXTRA", 999},
+	}, nil)
+	sc := &scanner{ctx: context.Background(), rows: rows, schema: internalTestSchema, size: 10}
+	if !sc.Next() {
+		t.Fatal("Next = false, want true")
+	}
+	c := sc.Chunk()
+	if err := c.Validate(); err != nil {
+		t.Fatalf("chunk invalid: %v", err)
+	}
+	if c.Columns[1][0] != nil {
+		t.Fatalf("short row cell = %v, want nil", c.Columns[1][0])
+	}
+	if got := c.Columns[1][1].(string); got != "b" {
+		t.Fatalf("row 1 col 1 = %v, want b", got)
+	}
+	if got := c.Columns[0][1].(int64); got != 2 {
+		t.Fatalf("row 1 col 0 = %v, want 2", got)
+	}
+}
+
+func TestInternalScannerClosedAndErrSticky(t *testing.T) {
+	rows := newFakeRows([][]any{{int64(1), "a"}}, nil)
+	sc := &scanner{ctx: context.Background(), rows: rows, schema: internalTestSchema, size: 10, closed: true}
+	if sc.Next() {
+		t.Fatal("Next when closed = true, want false")
+	}
+	sc2 := &scanner{ctx: context.Background(), rows: rows, schema: internalTestSchema, size: 10}
+	sc2.scanErr = errors.New("prior")
+	if sc2.Next() {
+		t.Fatal("Next with prior scanErr = true, want false")
+	}
+	if sc2.Err() == nil {
+		t.Fatal("Err must report prior error")
+	}
+}
+
+func TestInternalScannerCloseIdempotentWhenClosed(t *testing.T) {
+	// Pre-closed scanner with nil conn must not touch the connection.
+	sc := &scanner{closed: true}
+	if err := sc.Close(); err != nil {
+		t.Fatalf("Close on pre-closed = %v, want nil", err)
+	}
+	if err := sc.Close(); err != nil {
+		t.Fatalf("second Close = %v, want nil", err)
+	}
+}
